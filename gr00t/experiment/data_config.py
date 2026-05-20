@@ -772,6 +772,22 @@ class AgibotGenie1DataConfig(BaseDataConfig):
 
 ###########################################################################################
 
+def _load_libero_configs():
+    """Import LiberoDataConfig{,MeanStd} from examples/Libero/ lazily to avoid
+    importing user-example code at module load time."""
+    import importlib.util
+    import pathlib
+
+    custom_path = pathlib.Path(__file__).resolve().parents[2] / "examples" / "Libero" / "custom_data_config.py"
+    spec = importlib.util.spec_from_file_location("examples.Libero.custom_data_config", custom_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.LiberoDataConfig(), module.LiberoDataConfigMeanStd()
+
+
+_libero, _libero_mean_std = _load_libero_configs()
+
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -785,4 +801,6 @@ DATA_CONFIG_MAP = {
     "unitree_g1_full_body": UnitreeG1FullBodyDataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "agibot_genie1": AgibotGenie1DataConfig(),
+    "libero": _libero,
+    "libero_mean_std": _libero_mean_std,
 }

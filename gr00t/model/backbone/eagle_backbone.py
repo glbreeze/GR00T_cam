@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -20,6 +21,12 @@ from transformers import AutoConfig, AutoModel
 from transformers.feature_extraction_utils import BatchFeature
 
 import gr00t
+from gr00t.model.backbone.eagle_camvla_model import Eagle2_5_VLCamVLA
+
+
+@contextmanager
+def _null_context():
+    yield
 
 DEFAULT_EAGLE_PATH = os.path.join(
     os.path.dirname(gr00t.__file__), "model", "backbone", "eagle2_hg_model"
@@ -38,17 +45,69 @@ class EagleBackbone(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        use_camvla_model: bool = False,
+        use_ray_embed: bool = False,
+        cross_view_type: str = "none",
+        pose_enc_type: str = "null",
+        cross_view_aa_order: str = "fg",
+        cross_view_prope_layer_idx: tuple[int, ...] = (),
+        cross_view_rope_freq: float = 100.0,
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            use_camvla_model: if True, use the CamVLA subclass (Eagle2_5_VLCamVLA)
+                which exposes hooks for geometry modules. Identical behavior to
+                the parent class until those hooks are populated.
+            use_ray_embed: if True, add a per-patch ray embedding from K^-1.
+                Requires use_camvla_model=True and camera intrinsics in the batch.
+            cross_view_type: 'none' / 'simple' / 'standard'. Selects the cross-view
+                fusion topology. Requires use_camvla_model=True when != 'none'.
+            pose_enc_type: 'null' / 'prope'. When 'prope', PRoPE pose-injection
+                blocks are interleaved inside the standard fusion stack.
+                Requires cross_view_type='standard'.
+            cross_view_aa_order: ordering of frame ('f') and global ('g') blocks
+                in the standard fusion stack.
+            cross_view_prope_layer_idx: indices (into the 'g' sub-sequence of
+                aa_order) after which PRoPE pose-injection blocks are inserted.
+                Only used when pose_enc_type='prope'.
+            cross_view_rope_freq: frequency base for 2D RoPE in frame/global
+                blocks and for X/Y RoPE inside PRoPE attention. <= 0 disables
+                RoPE in the regular frame/global blocks (PoseInjectBlock still
+                uses RoPE internally with a default of 100.0).
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
+        # Any geometry knob set implies the CamVLA subclass.
+        geometry_requested = (
+            use_ray_embed
+            or cross_view_type != "none"
+            or pose_enc_type != "null"
+            or bool(cross_view_prope_layer_idx)
+        )
+        if geometry_requested and not use_camvla_model:
+            raise ValueError(
+                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx "
+                "require use_camvla_model=True"
+            )
+
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        if use_camvla_model:
+            self.eagle_model = Eagle2_5_VLCamVLA(config)
+            self.eagle_model.build_geometry_modules(
+                use_ray_embed=use_ray_embed,
+                cross_view_type=cross_view_type,
+                pose_enc_type=pose_enc_type,
+                aa_order=cross_view_aa_order,
+                prope_layer_idx=cross_view_prope_layer_idx,
+                rope_freq=cross_view_rope_freq,
+            )
+        else:
+            self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+
+        self._use_camvla_model = use_camvla_model
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
@@ -106,7 +165,19 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
-        eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+        # Route camera params (if present) to the CamVLA model's extract_feature
+        # via a context manager. The HF forward signature doesn't accept them,
+        # so we stash them on the model object for the duration of the call.
+        camera_params = {k: v for k, v in vl_input.items() if k.startswith("camera.")}
+        if self._use_camvla_model and camera_params:
+            ctx = self.eagle_model.camera_params_context(camera_params)
+        else:
+            ctx = self.eagle_model.camera_params_context(None) if self._use_camvla_model else _null_context()
+
+        with ctx:
+            eagle_output = self.eagle_model(
+                **eagle_input, output_hidden_states=True, return_dict=True
+            )
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
@@ -115,7 +186,7 @@ class EagleBackbone(nn.Module):
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask = self.forward_eagle(vl_input) # [bs, 564, 2048]
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility

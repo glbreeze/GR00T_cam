@@ -25,6 +25,7 @@ import tyro
 from transformers import TrainingArguments
 
 from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.dataset_camvla import CameraAwareLeRobotDataset
 from gr00t.data.schema import EmbodimentTag
 from gr00t.experiment.data_config import load_data_config
 from gr00t.experiment.runner import TrainRunner
@@ -81,6 +82,49 @@ class ArgsConfig:
 
     tune_diffusion_model: bool = True
     """Whether to fine-tune the diffusion model."""
+
+    use_camvla_model: bool = False
+    """If True, use the CamVLA Eagle2.5 subclass that exposes hooks for geometry
+    modules (ray embedding, cross-view attention, pi3x distillation). Identical
+    to baseline until those hooks are populated."""
+
+    use_ray_embed: bool = False
+    """If True, add a per-patch ray embedding from K^-1 to vit_embeds.
+    Pi3X-inspired, zero-initialised so disabling = no contribution.
+    Requires --use-camvla-model and camera intrinsics in the batch."""
+
+    cross_view_type: Literal["none", "simple", "standard"] = "none"
+    """Cross-view fusion topology applied to vit_embeds. 'simple' is one
+    bidirectional attention block across (V*N) tokens. 'standard' is a stack
+    of frame/global blocks per --cross-view-aa-order, into which PRoPE
+    pose-injection blocks can be interleaved. Requires --use-camvla-model."""
+
+    pose_enc_type: Literal["null", "prope"] = "null"
+    """How to inject camera pose. 'prope' interleaves PoseInjectBlocks inside
+    the standard cross-view fusion stack. Requires --cross-view-type standard."""
+
+    cross_view_aa_order: str = "fg"
+    """Frame/global ordering for the standard cross-view fusion stack, e.g.
+    'fg' = one frame block then one global block. Each char consumes one block."""
+
+    cross_view_prope_layer_idx: tuple[int, ...] = ()
+    """Indices (into the 'g' sub-sequence of cross_view_aa_order) after which
+    a PoseInjectBlock is inserted. Only used when --pose-enc-type prope."""
+
+    cross_view_rope_freq: float = 100.0
+    """Frequency base for 2D RoPE in cross-view frame/global blocks and for
+    X/Y RoPE inside PRoPE attention. Set <= 0 to disable RoPE in frame/global
+    blocks (PoseInjectBlock still uses RoPE internally with the same base)."""
+
+    use_camera_params: bool = False
+    """If True, load camera intrinsics/extrinsics from the parquet (via
+    CameraAwareLeRobotDataset) and route them through camera-aware video
+    transforms that keep K consistent with the augmented pixel grid."""
+
+    disable_geometric_augs: bool = False
+    """If True, drop the random crop from the video pipeline. Use when training
+    against a precomputed pi3x distillation cache (random crops would invalidate
+    the cached targets). Color jitter and the deterministic resize-to-224 stay."""
 
     resume: bool = False
     """Whether to resume from a checkpoint."""
@@ -198,12 +242,22 @@ def main(config: ArgsConfig):
 
     # 1.1 modality configs and transforms
     data_config_cls = load_data_config(config.data_config)
+    # Forward camera/aug flags into data configs that opt-in to them (only
+    # LiberoDataConfig today). Other configs ignore unknown attributes.
+    for attr in ("use_camera_params", "disable_geometric_augs"):
+        if hasattr(data_config_cls, attr):
+            setattr(data_config_cls, attr, getattr(config, attr))
     modality_configs = data_config_cls.modality_config()
     transforms = data_config_cls.transform()
 
+    # Pick the dataset class. CameraAwareLeRobotDataset auto-detects camera
+    # columns and falls back to the parent's behavior when they're absent, so
+    # it's only swapped in when the user opts in via --use-camera-params.
+    dataset_cls = CameraAwareLeRobotDataset if config.use_camera_params else LeRobotSingleDataset
+
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
-        train_dataset = LeRobotSingleDataset(
+        train_dataset = dataset_cls(
             dataset_path=config.dataset_path[0],
             modality_configs=modality_configs,
             transforms=transforms,
@@ -216,7 +270,7 @@ def main(config: ArgsConfig):
             assert os.path.exists(p), f"Dataset path {p} does not exist"
             ## We use the same transforms, modality configs, and embodiment tag for all datasets here,
             ## in reality, you can use dataset from different modalities and embodiment tags
-            dataset = LeRobotSingleDataset(
+            dataset = dataset_cls(
                 dataset_path=p,
                 modality_configs=modality_configs,
                 transforms=transforms,
@@ -262,6 +316,13 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        use_camvla_model=config.use_camvla_model,  # CamVLA subclass with geometry hooks
+        use_ray_embed=config.use_ray_embed,
+        cross_view_type=config.cross_view_type,
+        pose_enc_type=config.pose_enc_type,
+        cross_view_aa_order=config.cross_view_aa_order,
+        cross_view_prope_layer_idx=config.cross_view_prope_layer_idx,
+        cross_view_rope_freq=config.cross_view_rope_freq,
     )
 
     # Update action_horizon and max_action_dim to match data config

@@ -326,6 +326,14 @@ class GR00TTransform(InvertibleModalityTransform):
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."
             transformed_data[k] = v
 
+        # Pass through camera params (intrinsics/extrinsics) for the CamVLA path.
+        # When CameraAwareLeRobotDataset isn't in use, no `camera.*` keys exist
+        # in `data` and this loop is a no-op, so the baseline batch is unchanged.
+        for k, v in data.items():
+            if k.startswith("camera."):
+                assert k not in transformed_data, f"Key {k} already exists in transformed_data."
+                transformed_data[k] = v
+
         transformed_data["embodiment_id"] = self.get_embodiment_tag()
 
         if self.training:

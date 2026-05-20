@@ -24,11 +24,33 @@ from gr00t.data.transform.video import (
     VideoToNumpy,
     VideoToTensor,
 )
+from gr00t.data.transform.video_camvla import VideoCropCameraAware, VideoResizeCameraAware
 from gr00t.experiment.data_config import BaseDataConfig
 from gr00t.model.transforms import GR00TTransform
 
 
+# Maps each video key to the intrinsic key the CameraAwareLeRobotDataset emits.
+# Kept here (and not inside the camera-aware transforms) so it's obvious where
+# the pairing convention is defined.
+_LIBERO_INTRINSIC_KEYS = {
+    "video.image": "camera.agent_intrinsic",
+    "video.wrist_image": "camera.wrist_intrinsic",
+}
+
+
 class LiberoDataConfig(BaseDataConfig):
+    # When True, the transform chain uses camera-aware Video* variants that
+    # update agent/wrist intrinsics alongside the pixels. Pair with
+    # CameraAwareLeRobotDataset, which loads the paired K columns from the
+    # parquet. No-op if the dataset doesn't carry them.
+    use_camera_params: bool = False
+
+    # When True, drops the random crop from the pipeline. Used for pi3x
+    # distillation: pi3x targets are cached against a deterministic 224x224
+    # resize, so any per-sample geometric jitter (crop, rotation) would
+    # invalidate them. Color jitter (photometric) and the resize itself stay.
+    disable_geometric_augs: bool = False
+
     video_keys = [
         "video.image",
         "video.wrist_image",
@@ -74,19 +96,51 @@ class LiberoDataConfig(BaseDataConfig):
                     "action.gripper": "min_max",
                 },
             )
+        # Pick the crop and resize variants based on the use_camera_params flag.
+        # When use_camera_params=False, behavior is byte-for-byte identical to
+        # the upstream chain. When True, the camera-aware versions also update
+        # paired intrinsics in the sample dict.
+        if self.use_camera_params:
+            resize_cls = VideoResizeCameraAware
+            crop_cls = VideoCropCameraAware
+            resize_kwargs = {"intrinsic_keys": _LIBERO_INTRINSIC_KEYS}
+            crop_kwargs = {"intrinsic_keys": _LIBERO_INTRINSIC_KEYS}
+        else:
+            resize_cls = VideoResize
+            crop_cls = VideoCrop
+            resize_kwargs = {}
+            crop_kwargs = {}
+
+        video_transforms = [VideoToTensor(apply_to=self.video_keys)]
+        if not self.disable_geometric_augs:
+            video_transforms.append(
+                crop_cls(apply_to=self.video_keys, scale=0.95, **crop_kwargs)
+            )
+        video_transforms.append(
+            resize_cls(
+                apply_to=self.video_keys,
+                height=224,
+                width=224,
+                interpolation="linear",
+                **resize_kwargs,
+            )
+        )
+        video_transforms.extend(
+            [
+                VideoColorJitter(
+                    apply_to=self.video_keys,
+                    brightness=0.3,
+                    contrast=0.4,
+                    saturation=0.5,
+                    hue=0.08,
+                ),
+                VideoToNumpy(apply_to=self.video_keys),
+            ]
+        )
+
         transforms = [
             # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
-            VideoColorJitter(
-                apply_to=self.video_keys,
-                brightness=0.3,
-                contrast=0.4,
-                saturation=0.5,
-                hue=0.08,
-            ),
-            VideoToNumpy(apply_to=self.video_keys),
+            *video_transforms,
             # state transforms
             StateActionToTensor(apply_to=self.state_keys),
             StateActionTransform(

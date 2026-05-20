@@ -162,6 +162,7 @@ class GR00T_N1_5(PreTrainedModel):
         self,
         inputs: dict,
     ) -> BatchFeature:
+        import pdb; pdb.set_trace()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
@@ -202,12 +203,37 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        use_camvla_model = kwargs.pop("use_camvla_model", False)
+        use_ray_embed = kwargs.pop("use_ray_embed", False)
+        cross_view_type = kwargs.pop("cross_view_type", "none")
+        pose_enc_type = kwargs.pop("pose_enc_type", "null")
+        cross_view_aa_order = kwargs.pop("cross_view_aa_order", "fg")
+        cross_view_prope_layer_idx = tuple(kwargs.pop("cross_view_prope_layer_idx", ()) or ())
+        cross_view_rope_freq = float(kwargs.pop("cross_view_rope_freq", 100.0))
+        geometry_requested = (
+            use_ray_embed
+            or cross_view_type != "none"
+            or pose_enc_type != "null"
+            or bool(cross_view_prope_layer_idx)
+        )
+        if geometry_requested and not use_camvla_model:
+            raise ValueError(
+                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx "
+                "require use_camvla_model=True"
+            )
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
+        print(f"Use CamVLA backbone subclass: {use_camvla_model}")
+        print(
+            f"Geometry: ray_embed={use_ray_embed} cross_view={cross_view_type} "
+            f"pose_enc={pose_enc_type} aa_order={cross_view_aa_order!r} "
+            f"prope_layer_idx={cross_view_prope_layer_idx} "
+            f"rope_freq={cross_view_rope_freq}"
+        )
 
         # get the current model path being downloaded
         try:
@@ -221,9 +247,29 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
+        # Inject CamVLA flags into backbone_cfg before HF instantiates the model.
+        # backbone_cfg is a nested dict in the saved config; passing it via **kwargs
+        # would clobber the whole dict, so load the config explicitly and mutate it.
+        if use_camvla_model:
+            config = GR00T_N1_5_Config.from_pretrained(local_model_path)
+            config.backbone_cfg["use_camvla_model"] = True
+            config.backbone_cfg["use_ray_embed"] = use_ray_embed
+            config.backbone_cfg["cross_view_type"] = cross_view_type
+            config.backbone_cfg["pose_enc_type"] = pose_enc_type
+            config.backbone_cfg["cross_view_aa_order"] = cross_view_aa_order
+            config.backbone_cfg["cross_view_prope_layer_idx"] = cross_view_prope_layer_idx
+            config.backbone_cfg["cross_view_rope_freq"] = cross_view_rope_freq
+            kwargs["config"] = config
+
         pretrained_model = super().from_pretrained(
             local_model_path, local_model_path=local_model_path, **kwargs
         )
+
+        # HF's _init_weights overrides our zero-init for geometry modules that
+        # aren't in the checkpoint. Re-zero them so each enabled module starts
+        # as identity (otherwise their large random init produces NaN in bf16).
+        if use_camvla_model:
+            pretrained_model.backbone.eagle_model.reset_geometry_modules()
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm
