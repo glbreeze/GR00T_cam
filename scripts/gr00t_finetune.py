@@ -126,6 +126,63 @@ class ArgsConfig:
     against a precomputed pi3x distillation cache (random crops would invalidate
     the cached targets). Color jitter and the deterministic resize-to-224 stay."""
 
+    pi3x_root: str | None = None
+    """Path to a pi3x target cache (one ``episode_NNNNNN.npz`` per episode per
+    cam, e.g. ``.../pi3x_targets_224/libero_cam_v2``). Setting this enables the
+    distillation aux loss; requires --use-camvla-model, --use-camera-params, and
+    --disable-geometric-augs (the cache is tied to a deterministic 224x224 resize)."""
+
+    gt_point_root: str | None = None
+    """Path to a ground-truth pointmap cache (same on-disk layout as --pi3x-root:
+    ``episode_NNNNNN.npz`` per episode per cam under ``{root}/{agent,wrist}/``,
+    each with ``xy`` / ``log_z`` / ``conf`` arrays). Mirrors openpi's
+    ``gt_point_targets_root`` and the ``*_gtonly`` configs: supervises the
+    PointHead with ground-truth pointmaps derived from the simulator. Set this
+    alone for GT-only supervision, or alongside --pi3x-root for dual-loss
+    training (the two are mixed by --point-target-gt-weight). Shares the same
+    PointHead loss path and all --pi3x-loss-* knobs. Requires --use-camvla-model,
+    --use-camera-params, and --disable-geometric-augs."""
+
+    point_target_gt_weight: float = 0.5
+    """Dual-loss mix weight when BOTH --pi3x-root and --gt-point-root are set:
+    aux_loss = w * L(pred, gt) + (1 - w) * L(pred, pi3x), with w this value in
+    [0, 1]. Mirrors openpi's ``point_target_gt_ratio`` in ``dual_loss`` mode.
+    Ignored when only one point-target source is supplied."""
+
+    pi3x_loss_weight: float = 1.0
+    """Outer coefficient applied to the pi3x aux loss before adding it to the
+    action loss. Openpi uses 1.0 in stage 1, 0.05 in stage 2."""
+
+    pi3x_loss_type: Literal["pi3x_local_pointmap", "legacy_conf_mse"] = "pi3x_local_pointmap"
+    """Which pi3x loss to apply. 'pi3x_local_pointmap' (default) matches openpi's
+    stage-1/2 training. 'legacy_conf_mse' is a simpler hard-confidence-gated L2
+    that skips the per-sample scale alignment."""
+
+    pi3x_ray_loss_weight: float = 1.0
+    """Ray-direction (xy) loss weight inside pi3x_local_pointmap."""
+
+    pi3x_depth_loss_weight: float = 1.0
+    """Depth (z) loss weight inside pi3x_local_pointmap."""
+
+    pi3x_depth_weighting: Literal["pi3x_inverse", "uniform"] = "pi3x_inverse"
+    """Depth-weighting scheme inside pi3x_local_pointmap. 'pi3x_inverse' down-
+    weights far points (matches openpi); 'uniform' treats all valid points equally."""
+
+    action_loss_weight: float = 1.0
+    """Multiplier on the action (flow-matching) loss before adding the pi3x aux
+    loss. Two-stage training mirrors openpi: 0.1 in stage 1 (geometry warmup -
+    aux dominates and still trickles gradient back through the frozen action
+    path into cross_view_fusion), 1.0 in stage 2 (action-focused fine-tune)."""
+
+    trainable_prefixes: tuple[str, ...] = ()
+    """If non-empty, freeze every parameter whose name does NOT start with one
+    of these prefixes (matched against ``model.named_parameters()``). Applied
+    AFTER tune_visual/tune_llm/tune_projector/tune_diffusion_model, overriding
+    them. Used for stage-1 geometry warmup, e.g.
+    ``--trainable-prefixes backbone.eagle_model.ray_embed_module
+    backbone.eagle_model.cross_view_fusion backbone.eagle_model.point_head``.
+    Mirrors openpi's ``trainable_prefixes``."""
+
     resume: bool = False
     """Whether to resume from a checkpoint."""
 
@@ -138,6 +195,18 @@ class ArgsConfig:
 
     warmup_ratio: float = 0.05
     """Ratio of total training steps used for warmup."""
+
+    lr_scheduler_type: str = "cosine"
+    """HuggingFace LR-scheduler family. Default ``cosine`` decays peak_lr -> 0
+    at max_steps. Use ``cosine_with_min_lr`` to floor the schedule at a fraction
+    of the peak LR (set ``--min-lr-rate`` accordingly). openpi's
+    CosineDecaySchedule corresponds to ``cosine_with_min_lr`` + ``min_lr_rate=0.1``."""
+
+    min_lr_rate: float = 0.0
+    """Floor of the cosine schedule expressed as a fraction of the peak LR.
+    Only applied when ``--lr-scheduler-type cosine_with_min_lr`` is set; ignored
+    by every other scheduler (which is HF's behavior). Defaults to 0.0 so the
+    plain ``cosine`` path is byte-for-byte unchanged."""
 
     lora_rank: int = 0
     """Rank for the LORA model. If 0, no LORA will be used."""
@@ -237,6 +306,37 @@ def _copy_partial_action_expert_weights(old_dict, new_dict, old_dim, new_dim):
 
 def main(config: ArgsConfig):
     """Main training function."""
+    # Point-head supervision can draw from two caches: pi3x teacher predictions
+    # (--pi3x-root, distillation) and/or ground-truth pointmaps from the
+    # simulator (--gt-point-root). Setting both enables dual-loss training
+    # (mixed by --point-target-gt-weight). Either source requires the rest of
+    # the camera-aware stack: CamVLA backbone (to host the PointHead), parquet
+    # camera params (so K is known to the model), and disabled geometric augs
+    # (the cache assumes a deterministic 224x224 resize and is invalidated by
+    # random crops).
+    use_point_supervision = config.pi3x_root is not None or config.gt_point_root is not None
+    if use_point_supervision:
+        flags = [
+            f for f, on in (
+                ("--pi3x-root", config.pi3x_root is not None),
+                ("--gt-point-root", config.gt_point_root is not None),
+            ) if on
+        ]
+        missing = [
+            name
+            for name, value in (
+                ("--use-camvla-model", config.use_camvla_model),
+                ("--use-camera-params", config.use_camera_params),
+                ("--disable-geometric-augs", config.disable_geometric_augs),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"{' / '.join(flags)} requires {', '.join(missing)} (cache is tied to a "
+                "deterministic 224x224 resize with K-aware transforms)"
+            )
+
     # ------------ step 1: load dataset ------------
     embodiment_tag = EmbodimentTag(config.embodiment_tag)
 
@@ -254,6 +354,12 @@ def main(config: ArgsConfig):
     # columns and falls back to the parent's behavior when they're absent, so
     # it's only swapped in when the user opts in via --use-camera-params.
     dataset_cls = CameraAwareLeRobotDataset if config.use_camera_params else LeRobotSingleDataset
+    dataset_kwargs: dict = {}
+    if config.use_camera_params:
+        if config.pi3x_root is not None:
+            dataset_kwargs["pi3x_root"] = config.pi3x_root
+        if config.gt_point_root is not None:
+            dataset_kwargs["gt_point_root"] = config.gt_point_root
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
@@ -263,6 +369,7 @@ def main(config: ArgsConfig):
             transforms=transforms,
             embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
             video_backend=config.video_backend,
+            **dataset_kwargs,
         )
     else:
         single_datasets = []
@@ -276,6 +383,7 @@ def main(config: ArgsConfig):
                 transforms=transforms,
                 embodiment_tag=embodiment_tag,
                 video_backend=config.video_backend,
+                **dataset_kwargs,
             )
             single_datasets.append(dataset)
 
@@ -323,6 +431,15 @@ def main(config: ArgsConfig):
         cross_view_aa_order=config.cross_view_aa_order,
         cross_view_prope_layer_idx=config.cross_view_prope_layer_idx,
         cross_view_rope_freq=config.cross_view_rope_freq,
+        use_pi3x_distill=use_point_supervision,
+        pi3x_loss_weight=config.pi3x_loss_weight,
+        pi3x_loss_type=config.pi3x_loss_type,
+        pi3x_ray_loss_weight=config.pi3x_ray_loss_weight,
+        pi3x_depth_loss_weight=config.pi3x_depth_loss_weight,
+        pi3x_depth_weighting=config.pi3x_depth_weighting,
+        point_target_gt_weight=config.point_target_gt_weight,
+        action_loss_weight=config.action_loss_weight,
+        trainable_prefixes=config.trainable_prefixes,
     )
 
     # Update action_horizon and max_action_dim to match data config
@@ -425,7 +542,12 @@ def main(config: ArgsConfig):
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=config.lr_scheduler_type,
+        lr_scheduler_kwargs=(
+            {"min_lr_rate": config.min_lr_rate}
+            if config.lr_scheduler_type == "cosine_with_min_lr"
+            else None
+        ),
         logging_steps=10.0,
         num_train_epochs=300,
         max_steps=config.max_steps,
