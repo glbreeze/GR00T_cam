@@ -15,6 +15,7 @@
 
 
 import os
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -28,6 +29,19 @@ from transformers.trainer import (
     get_last_checkpoint,
     get_parameter_names,
     is_sagemaker_mp_enabled,
+)
+
+# Extra scalar keys the model's forward may emit alongside `loss`. We
+# accumulate them across grad-accum microbatches and inject the running
+# mean into HF Trainer's `log()` payload so wandb/tensorboard pick them up.
+# Values that are absent on a given step are silently skipped.
+_EXTRA_LOSS_KEYS = (
+    "action_loss",
+    "aux_loss",
+    "aux_xy_loss",
+    "aux_z_loss",
+    "aux_gt_loss",
+    "aux_pi3x_loss",
 )
 
 
@@ -69,6 +83,12 @@ class DualBrainTrainer(transformers.Trainer):
         torch.serialization.add_safe_globals(
             [np.core.multiarray._reconstruct, np.ndarray, np.dtype, np.dtypes.UInt32DType]
         )
+        # Rank-local accumulator for extra scalars emitted by model.forward
+        # (action_loss / aux_loss / aux_xy_loss / aux_z_loss). Reset whenever
+        # we flush into `log()`. NOTE: these are rank-local averages, not
+        # all-reduced like HF's main `loss` — fine for monitoring.
+        self._extra_loss_sum: dict = defaultdict(float)
+        self._extra_loss_n: int = 0
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -79,7 +99,28 @@ class DualBrainTrainer(transformers.Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(inputs)
         loss = outputs["loss"]
+        # Accumulate optional scalar metrics for `log()`. Skipped silently
+        # when the key is absent (e.g. baseline run with no pi3x distill).
+        if self.model.training:
+            for key in _EXTRA_LOSS_KEYS:
+                if key not in outputs:
+                    continue
+                v = outputs[key]
+                if torch.is_tensor(v):
+                    v = v.detach().float().item()
+                self._extra_loss_sum[key] += float(v)
+            self._extra_loss_n += 1
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: dict, start_time: Optional[float] = None) -> None:
+        # Inject the running means of extra scalars into the same payload HF
+        # Trainer sends to its callbacks (wandb, tensorboard, console).
+        if self._extra_loss_n > 0:
+            for key, total in self._extra_loss_sum.items():
+                logs[key] = total / self._extra_loss_n
+            self._extra_loss_sum.clear()
+            self._extra_loss_n = 0
+        return super().log(logs, start_time=start_time)
 
     def create_optimizer(self):
         """

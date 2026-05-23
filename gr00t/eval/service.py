@@ -22,7 +22,25 @@ import msgpack
 import numpy as np
 import zmq
 
-from gr00t.data.dataset import ModalityConfig
+
+# ModalityConfig is resolved lazily so that clients living in a lightweight
+# env (e.g. the LIBERO eval running under openpi's venv) can import this
+# module — and thus use the ZMQ wire protocol — without pulling in
+# gr00t.data.dataset, which transitively requires pytorch3d, decord, and the
+# full transform stack. The class is only needed for the get_modality_config
+# endpoint; get_action traffic is just np.ndarrays + plain Python types.
+_MODALITY_CONFIG_CLS = None  # None = unresolved; False = unavailable
+
+
+def _modality_config_cls():
+    global _MODALITY_CONFIG_CLS
+    if _MODALITY_CONFIG_CLS is None:
+        try:
+            from gr00t.data.dataset import ModalityConfig as _MC
+            _MODALITY_CONFIG_CLS = _MC
+        except ImportError:
+            _MODALITY_CONFIG_CLS = False
+    return _MODALITY_CONFIG_CLS if _MODALITY_CONFIG_CLS is not False else None
 
 
 class MsgSerializer:
@@ -37,14 +55,22 @@ class MsgSerializer:
     @staticmethod
     def decode_custom_classes(obj):
         if "__ModalityConfig_class__" in obj:
-            obj = ModalityConfig(**json.loads(obj["as_json"]))
+            mc_cls = _modality_config_cls()
+            if mc_cls is None:
+                raise RuntimeError(
+                    "Received a ModalityConfig over the wire but gr00t.data.dataset "
+                    "is not importable in this environment. Install the full gr00t "
+                    "stack, or only call endpoints that return ndarrays."
+                )
+            obj = mc_cls(**json.loads(obj["as_json"]))
         if "__ndarray_class__" in obj:
             obj = np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
         return obj
 
     @staticmethod
     def encode_custom_classes(obj):
-        if isinstance(obj, ModalityConfig):
+        mc_cls = _modality_config_cls()
+        if mc_cls is not None and isinstance(obj, mc_cls):
             return {"__ModalityConfig_class__": True, "as_json": obj.model_dump_json()}
         if isinstance(obj, np.ndarray):
             output = io.BytesIO()

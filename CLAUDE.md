@@ -9,7 +9,7 @@ Isaac GR00T N1.5 is an open vision-language-action (VLA) model for generalized h
 - **Language:** Python 3.10 (tested with CUDA 12.4 recommended; 11.8 verified)
 - **Package manager:** pip (conda env recommended)
 - **Build system:** setuptools + setuptools_scm (see `pyproject.toml`; package name `gr00t`, version `1.1.0`)
-- **Branch context:** this checkout is at tag `n1.5-release` in detached HEAD; create a working branch (`git switch -c <name>`) before making commits.
+- **Branch context:** this is a fork of `nvidia/Isaac-GR00T` at tag `n1.5-release`. The `main` branch carries local research commits on top (currently a CamVLA / camera-aware geometry extension — see *CamVLA extensions* below). Upstream N1.5 baseline is at commit `4af2b62` and earlier.
 
 ## Quick-start commands
 
@@ -90,9 +90,46 @@ Three independent paths share the model but diverge after that:
 
 `gr00t/eval/wrappers/`, `gr00t/eval/simulation.py`, and `gr00t/eval/robot.py` integrate with benchmark envs (LIBERO, RoboCasa, SimplerEnv) and real-robot bridges. Per-benchmark examples live under `examples/{Libero, RoboCasa, SimplerEnv, SO-100, UnitreeG1}/`.
 
+### CamVLA extensions (this fork)
+
+Commit `16cd644` ("setup geometric modules") adds an opt-in **camera-aware** path on top of the N1.5 baseline. It is gated behind flags and falls back to byte-for-byte baseline behavior when disabled. The key pieces:
+
+- **Camera-aware dataset:** `gr00t/data/dataset_camvla.py::CameraAwareLeRobotDataset` reads intrinsic/extrinsic columns (`{agent,wrist}_{intrinsic,extrinsic}`) directly from the parquet (bypasses `modality.json`, which only supports 1D state slices). Auto-detects columns and no-ops if absent.
+- **Camera-aware transforms:** `gr00t/data/transform/video_camvla.py` (`VideoResizeCameraAware`, `VideoCropCameraAware`) — keep `K` consistent with the augmented pixel grid (`K' = T_pixel @ K`). Extrinsics are pass-through. Per-video→intrinsic pairing is declared in the data config (see `examples/Libero/custom_data_config.py::_LIBERO_INTRINSIC_KEYS`).
+- **Camera-aware backbone subclass:** `gr00t/model/backbone/eagle_camvla_model.py::Eagle2_5_VLCamVLA` extends Eagle2.5 with three geometry modules — patch-token **ray embedding** from `K^-1`, **cross-view fusion** (`simple`/`standard` topology), and **PRoPE** pose-injection blocks. All modules are zero-initialised by `reset_geometry_modules()` (called from `GR00T_N1_5.from_pretrained` after HF init, which otherwise overrides the zero-init and would NaN in bf16). Hyperparameter names mirror `openpi.models.cross_view_config.CrossViewFusionConfig` and `openpi.models_pytorch.layers.prope` so configs port between codebases.
+- **Wiring:** `scripts/gr00t_finetune.py` forwards CamVLA flags through `GR00T_N1_5.from_pretrained` → `EagleBackbone` → `Eagle2_5_VLCamVLA`. Validation rule: any of `use_ray_embed` / `cross_view_type != "none"` / `pose_enc_type != "null"` / `cross_view_prope_layer_idx` **requires** `--use-camvla-model`.
+- **Libero data configs:** loaded lazily from `examples/Libero/custom_data_config.py` and injected into `DATA_CONFIG_MAP` as `"libero"` and `"libero_mean_std"` (see the `_load_libero_configs()` shim in `gr00t/experiment/data_config.py`).
+
+**Four supported CamVLA invocation modes** (from `scripts/run_all.sh`):
+
+```bash
+# 1) Baseline (byte-for-byte unchanged)
+python scripts/gr00t_finetune.py --dataset-path <libero-gr00t> --data-config libero --video-backend decord
+
+# 2) Baseline + CamVLA subclass (model hooks present, no data changes)
+... --use-camvla-model
+
+# 3) Full camera-aware (random crop active, K stays in sync)
+... --use-camera-params --use-camvla-model
+
+# 4) Pi3x distillation mode (deterministic resize + color jitter only, cache-aligned)
+... --use-camera-params --use-camvla-model --disable-geometric-augs
+```
+
+**Point-head supervision (pi3x / GT / dual).** The `PointHead` (`gr00t/model/backbone/point_head.py`, patch-resolution 16×16 only) can be supervised from two interchangeable on-disk caches that share the same npz schema (`xy`/`log_z`/`conf` per cam per episode, full-res; the loader average-pools to the 16×16 patch grid):
+
+- `--pi3x-root <cache>` — teacher (pi3x) predictions, emitted on the `pi3x.*` batch channel (distillation).
+- `--gt-point-root <cache>` — ground-truth pointmaps from the simulator, emitted on the `gt.*` channel. Mirrors openpi's `gt_point_targets_root` / `*_gtonly` configs.
+- **Both set ⇒ dual-loss:** `aux_loss = w·L(pred, gt) + (1−w)·L(pred, pi3x)`, with `w = --point-target-gt-weight` (default 0.5). Mirrors openpi's `point_target_mix_mode="dual_loss"`. Per-channel `aux_gt_loss` / `aux_pi3x_loss` are logged to wandb alongside the combined `aux_loss`.
+
+Either source requires `--use-camvla-model --use-camera-params --disable-geometric-augs` (the cache is tied to a deterministic 224×224 resize). The loss path lives in `gr00t/model/backbone/eagle_backbone.py::_compute_point_loss`; targets flow through `CameraAwareLeRobotDataset(pi3x_root=, gt_point_root=)`. The LIBERO GT cache (4-suite, frame-aligned) is at `/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_targets_224/libero_cam_v2_aligned`. SLURM drivers: `scripts/sbatch_lg/train_libero_geo_distill_stage{1,2}_gtonly.sbatch` (GT-only) and `train_libero_geo_distill_stage2_dual.sbatch` (dual).
+
+**Dataset conversion for Libero:** `examples/Libero/convert_openpi_lerobot_to_gr00t.py` converts openpi-flavor LeRobot (PNG images) to GR00T-flavor LeRobot (MP4 videos) while preserving the openpi `agent_/wrist_` `extrinsic/intrinsic` columns so CamVLA can consume them later without re-running the conversion. Driver script: `scripts/sbatch_lg/convert_libero_cam_v2.sh`.
+
 ## Key entry points
 
-- **Fine-tune:** `python scripts/gr00t_finetune.py --dataset-path <path> [--num-gpus N] [--no-tune_diffusion_model]`
+- **Fine-tune (baseline):** `python scripts/gr00t_finetune.py --dataset-path <path> [--num-gpus N] [--no-tune_diffusion_model]`
+- **Fine-tune (CamVLA, Libero):** see the four modes in *CamVLA extensions* above; SLURM driver at `scripts/sbatch_lg/train.sh`.
 - **Eval (offline, plot):** `python scripts/eval_policy.py --plot --model_path <path>`
 - **Inference server:** `python scripts/inference_service.py --model-path <path> --embodiment-tag <tag>`
 - **Simulation service:** `python scripts/simulation_service.py`

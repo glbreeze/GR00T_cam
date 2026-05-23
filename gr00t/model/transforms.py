@@ -326,11 +326,13 @@ class GR00TTransform(InvertibleModalityTransform):
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."
             transformed_data[k] = v
 
-        # Pass through camera params (intrinsics/extrinsics) for the CamVLA path.
-        # When CameraAwareLeRobotDataset isn't in use, no `camera.*` keys exist
-        # in `data` and this loop is a no-op, so the baseline batch is unchanged.
+        # Pass through camera params (intrinsics/extrinsics) and point-head
+        # supervision targets for the CamVLA path: pi3x.* (teacher distillation)
+        # and gt.* (ground-truth pointmaps). When CameraAwareLeRobotDataset isn't
+        # in use, none of these prefixes appear in `data` and this loop is a
+        # no-op, so the baseline batch is unchanged.
         for k, v in data.items():
-            if k.startswith("camera."):
+            if k.startswith("camera.") or k.startswith("pi3x.") or k.startswith("gt."):
                 assert k not in transformed_data, f"Key {k} already exists in transformed_data."
                 transformed_data[k] = v
 

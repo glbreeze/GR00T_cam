@@ -18,7 +18,6 @@ import random
 from typing import Any, ClassVar
 
 import numpy as np
-import pytorch3d.transforms as pt
 import torch
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
@@ -37,6 +36,11 @@ class RotationTransform:
 
         Always use matrix as intermediate representation.
         """
+        # Lazy import so the eval client can pull in modules that transitively
+        # touch this file (gr00t.eval.service -> gr00t.data.dataset ->
+        # gr00t.data.transform) without requiring pytorch3d on the client side.
+        import pytorch3d.transforms as pt
+
         if from_rep.startswith("euler_angles"):
             from_convention = from_rep.split("_")[-1]
             from_rep = "euler_angles"

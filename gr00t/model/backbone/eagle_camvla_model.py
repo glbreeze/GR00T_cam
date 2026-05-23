@@ -40,6 +40,7 @@ import torch.nn.functional as F
 
 from .eagle2_hg_model.configuration_eagle2_5_vl import Eagle2_5_VLConfig
 from .eagle2_hg_model.modeling_eagle2_5_vl import Eagle2_5_VLForConditionalGeneration
+from .point_head import PointHead
 
 
 # ---------------------------------------------------------------------------
@@ -648,9 +649,14 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
         self.aa_order: str = "fg"
         self.prope_layer_idx: tuple[int, ...] = ()
         self.rope_freq: float = 100.0
+        self.use_pi3x_distill: bool = False
         self._geometry_built: bool = False
 
         self._pending_camera_params: dict[str, torch.Tensor] | None = None
+        # Set by extract_feature when use_pi3x_distill is on; tuple of
+        # ``(xy_pred, logz_pred)``, each ``(B, V, P, *)``. Read by
+        # EagleBackbone.forward to compute the distillation loss.
+        self._pending_pi3x_preds: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def build_geometry_modules(
         self,
@@ -661,6 +667,12 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
         aa_order: str = "fg",
         prope_layer_idx: Sequence[int] = (),
         rope_freq: float = 100.0,
+        use_pi3x_distill: bool = False,
+        pi3x_hidden_dim: int = 512,
+        pi3x_depth: int = 2,
+        pi3x_num_heads: int = 8,
+        pi3x_rope_freq: float = 100.0,
+        pi3x_qk_norm: bool = True,
     ) -> None:
         if cross_view_type not in _VALID_CROSS_VIEW:
             raise ValueError(f"cross_view_type must be one of {_VALID_CROSS_VIEW}, got {cross_view_type!r}")
@@ -683,6 +695,7 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
         self.aa_order = aa_order
         self.prope_layer_idx = tuple(int(i) for i in prope_layer_idx)
         self.rope_freq = float(rope_freq)
+        self.use_pi3x_distill = bool(use_pi3x_distill)
 
         D = self.config.text_config.hidden_size
         patch_size = self.config.vision_config.patch_size
@@ -701,38 +714,93 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
                 rope_freq=self.rope_freq,
             )
 
+        if self.use_pi3x_distill:
+            # PointHead taps post-cross-view-fusion vit_embeds, so its in_dim
+            # matches the post-pixel-shuffle hidden dim of Eagle's vision path.
+            self.point_head = PointHead(
+                in_dim=D,
+                hidden_dim=pi3x_hidden_dim,
+                depth=pi3x_depth,
+                num_heads=pi3x_num_heads,
+                mlp_ratio=4.0,
+                patch_h=16,
+                patch_w=16,
+                rope_freq=pi3x_rope_freq,
+                qk_norm=pi3x_qk_norm,
+                init_values=0.01,
+            )
+
         self._geometry_built = True
 
     def reset_geometry_modules(self) -> None:
-        """Zero all learnable params of enabled geometry modules.
+        """Re-initialise the geometry modules to a safe, *identity-on-step-0*,
+        trainable state.
 
-        Run *after* HF's ``from_pretrained`` so that the loader's
-        ``_init_weights`` does not leave them with large random values that
-        would NaN in bf16. LayerNorm weights are set to 1 (identity-on-input-
-        scale); every other parameter is zeroed.
+        Run *after* HF's ``from_pretrained``, which calls ``_init_weights`` on
+        every new (not-in-checkpoint) module. Eagle's ``_init_weights`` sets
+        ``Linear`` / ``Conv2d`` weights to ``Normal(0, 0.02)`` and biases to
+        zero — empirically that can produce bf16 NaN on the first forward
+        through our extra ``q_norm`` / ``k_norm`` / PRoPE paths.
+
+        Strategy per module:
+
+        * ``RayEmbed`` — zero its ``Conv2d`` weight & bias. Output is zero, so
+          ``vit_embeds += RayEmbed(K)`` is identity on step 0. Gradient still
+          flows: ``d/d(weight) = input * d_out``, and ``input`` (the rays
+          from ``K^-1·[u,v,1]``) is non-zero.
+
+        * ``TransformerBlock`` / ``PoseInjectBlock`` — Linear/LayerNorm submodules
+          get ``reset_parameters()`` (PyTorch's Kaiming-uniform + ones/zeros,
+          bf16-safe). The LayerScale gates ``ls1`` / ``ls2`` are *zeroed* so
+          the block's contribution to its input is exactly zero on step 0 —
+          ``x_new = x + ls1·attn(x) + ls2·mlp(x) = x`` — and the frozen
+          pretrained LLM sees the same vit_embeds as baseline.
+
+          Gradient bootstrap: ``d(loss)/d(ls) = ⟨d(loss)/d(x_new), a⟩`` where
+          ``a = attn(x)`` is *non-zero* (weights at PyTorch defaults). So
+          ``ls`` receives a non-zero gradient on step 0 and grows. Once ``ls``
+          is non-zero, the trunk (qkv, proj, mlp) starts receiving gradients
+          via ``d(loss)/d(a) = ls · upstream``.
+
+        * ``PointHead`` — full ``reset_to_zero`` (its trunk uses PyTorch
+          defaults; only ``linear_out`` is zeroed so step-0 head output is
+          exactly zero). Gradients reach the trunk from step 1 once
+          ``linear_out`` is non-zero.
         """
 
-        def _zero_block(blk: nn.Module) -> None:
-            for name, p in blk.named_parameters():
-                if "norm" in name and name.endswith(".weight"):
-                    nn.init.ones_(p)
-                else:
+        def _safe_reset_block(blk: nn.Module) -> None:
+            for m in blk.modules():
+                if isinstance(m, (nn.Linear, nn.LayerNorm)):
+                    m.reset_parameters()
+            # Zero LayerScale gates so the block is identity on step 0.
+            # ``d/d(ls) = a`` (the multiplicand) — non-zero, so ls bootstraps.
+            for pname in ("ls1", "ls2"):
+                p = getattr(blk, pname, None)
+                if isinstance(p, nn.Parameter):
                     nn.init.zeros_(p)
 
         if getattr(self, "ray_embed_module", None) is not None:
+            # Iterate parameters() rather than touching ``proj.weight`` /
+            # ``proj.bias`` by name — Conv2d's bias is typed ``Tensor | None``
+            # and ``Conv2d(..., bias=False)`` would otherwise crash the type
+            # check. RayEmbed always constructs with ``bias=True``, but this
+            # form stays correct if the module's internals ever change.
             for p in self.ray_embed_module.parameters():
                 nn.init.zeros_(p)
 
         fusion = getattr(self, "cross_view_fusion", None)
         if isinstance(fusion, SimpleCrossViewFusion):
-            _zero_block(fusion.block)
+            _safe_reset_block(fusion.block)
         elif isinstance(fusion, StandardCrossViewFusion):
             for blk in fusion.frame_blocks:
-                _zero_block(blk)
+                _safe_reset_block(blk)
             for blk in fusion.global_blocks:
-                _zero_block(blk)
+                _safe_reset_block(blk)
             for blk in fusion.pose_inject_blocks:
-                _zero_block(blk)
+                _safe_reset_block(blk)
+
+        if getattr(self, "point_head", None) is not None:
+            self.point_head.reset_to_zero()
 
     @contextmanager
     def camera_params_context(self, camera_params: dict[str, torch.Tensor] | None):
@@ -789,6 +857,20 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
                     )
 
             vit_embeds = x.reshape(B * V, N, D)
+
+        # PointHead consumes post-fusion features. When cross-view is off, we
+        # still want to tap (just the raw vit tokens, possibly with ray embed),
+        # so reshape on-the-fly to (B, V, N, D) using the same V-inference rule.
+        # Result is stashed for EagleBackbone.forward to pick up and combine
+        # with the targets from the input batch.
+        self._pending_pi3x_preds = None
+        if self.use_pi3x_distill and getattr(self, "point_head", None) is not None:
+            BV, N, D = vit_embeds.shape
+            V = self._infer_num_views(BV, Ks)
+            B = BV // V
+            x_bv = vit_embeds.reshape(B, V, N, D)
+            xy_pred, logz_pred = self.point_head(x_bv)  # (B, V, P, 2), (B, V, P, 1)
+            self._pending_pi3x_preds = (xy_pred, logz_pred)
 
         return vit_embeds
 

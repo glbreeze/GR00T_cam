@@ -22,6 +22,7 @@ from transformers.feature_extraction_utils import BatchFeature
 
 import gr00t
 from gr00t.model.backbone.eagle_camvla_model import Eagle2_5_VLCamVLA
+from gr00t.model.losses.pi3x import legacy_conf_mse_loss, pi3x_point_loss
 
 
 @contextmanager
@@ -52,6 +53,14 @@ class EagleBackbone(nn.Module):
         cross_view_aa_order: str = "fg",
         cross_view_prope_layer_idx: tuple[int, ...] = (),
         cross_view_rope_freq: float = 100.0,
+        use_pi3x_distill: bool = False,
+        pi3x_loss_type: str = "pi3x_local_pointmap",
+        pi3x_ray_loss_weight: float = 1.0,
+        pi3x_depth_loss_weight: float = 1.0,
+        pi3x_depth_weighting: str = "pi3x_inverse",
+        pi3x_legacy_conf_threshold: float = 0.1,
+        pi3x_legacy_order: int = 2,
+        point_target_gt_weight: float = 0.5,
     ):
         """
         Args:
@@ -86,11 +95,18 @@ class EagleBackbone(nn.Module):
             or cross_view_type != "none"
             or pose_enc_type != "null"
             or bool(cross_view_prope_layer_idx)
+            or use_pi3x_distill
         )
         if geometry_requested and not use_camvla_model:
             raise ValueError(
-                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx "
-                "require use_camvla_model=True"
+                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx / "
+                "use_pi3x_distill require use_camvla_model=True"
+            )
+
+        if pi3x_loss_type not in ("pi3x_local_pointmap", "legacy_conf_mse"):
+            raise ValueError(
+                f"pi3x_loss_type must be 'pi3x_local_pointmap' or 'legacy_conf_mse', "
+                f"got {pi3x_loss_type!r}"
             )
 
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
@@ -103,11 +119,27 @@ class EagleBackbone(nn.Module):
                 aa_order=cross_view_aa_order,
                 prope_layer_idx=cross_view_prope_layer_idx,
                 rope_freq=cross_view_rope_freq,
+                use_pi3x_distill=use_pi3x_distill,
             )
         else:
             self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         self._use_camvla_model = use_camvla_model
+        self._use_pi3x_distill = use_pi3x_distill
+        self._pi3x_loss_type = pi3x_loss_type
+        self._pi3x_ray_loss_weight = float(pi3x_ray_loss_weight)
+        self._pi3x_depth_loss_weight = float(pi3x_depth_loss_weight)
+        self._pi3x_depth_weighting = pi3x_depth_weighting
+        self._pi3x_legacy_conf_threshold = float(pi3x_legacy_conf_threshold)
+        self._pi3x_legacy_order = int(pi3x_legacy_order)
+        # Dual-loss mix when both pi3x.* (teacher) and gt.* (ground truth)
+        # targets are present: total = w_gt * L(pred, gt) + (1-w_gt) * L(pred, pi3x).
+        # Ignored when only one channel is supplied.
+        self._point_target_gt_weight = float(point_target_gt_weight)
+        if not 0.0 <= self._point_target_gt_weight <= 1.0:
+            raise ValueError(
+                f"point_target_gt_weight must be in [0, 1], got {self._point_target_gt_weight}"
+            )
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
@@ -183,6 +215,107 @@ class EagleBackbone(nn.Module):
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
 
+    def _point_loss_for_channel(
+        self, vl_input: BatchFeature, prefix: str, preds: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Run the configured point loss for one target channel (``pi3x`` or ``gt``).
+
+        Returns ``(total, aux_xy, aux_z)`` — for ``pi3x_local_pointmap`` the
+        components are (ray_loss, depth_loss); for ``legacy_conf_mse`` they are
+        (xy_loss, z_loss). Returns ``None`` if the channel's targets are absent.
+        """
+        if not all(k in vl_input for k in (f"{prefix}.xy", f"{prefix}.logz", f"{prefix}.conf")):
+            return None
+
+        xy_pred, logz_pred = preds  # (B, V, P, 2), (B, V, P, 1)
+        B, V_pred, P, _ = xy_pred.shape
+
+        # Targets arrive as (B, V, H, W, *) — flatten the H*W axes into P to
+        # match the head's output. We cast to the head's dtype (bf16 in
+        # training) so loss ops don't auto-upcast.
+        def _to_BVP(t: torch.Tensor, last_dim: int) -> torch.Tensor:
+            assert t.ndim == 5, f"expected (B, V, H, W, {last_dim}), got shape {tuple(t.shape)}"
+            return t.reshape(B, t.shape[1], -1, last_dim).to(dtype=xy_pred.dtype)
+
+        xy_t = _to_BVP(vl_input[f"{prefix}.xy"], 2)
+        logz_t = _to_BVP(vl_input[f"{prefix}.logz"], 1)
+        conf_t = _to_BVP(vl_input[f"{prefix}.conf"], 1)
+
+        # Reconcile V: padded views with no target are dropped (matches openpi's
+        # loss site slicing ``pred[:, :V_tgt]``).
+        V_tgt = xy_t.shape[1]
+        if V_tgt > V_pred:
+            raise ValueError(
+                f"{prefix} target has V={V_tgt} but PointHead predicted V={V_pred}; "
+                "check PI3X_CAM_SUBDIRS order vs. the model-side cam order."
+            )
+        xy_pred = xy_pred[:, :V_tgt]
+        logz_pred = logz_pred[:, :V_tgt]
+
+        if self._pi3x_loss_type == "pi3x_local_pointmap":
+            total, ray_or_xy, depth_or_z, _scale = pi3x_point_loss(
+                xy_pred=xy_pred,
+                logz_pred=logz_pred,
+                xy_target=xy_t,
+                logz_target=logz_t,
+                conf_target=conf_t,
+                ray_loss_weight=self._pi3x_ray_loss_weight,
+                depth_loss_weight=self._pi3x_depth_loss_weight,
+                depth_weighting=self._pi3x_depth_weighting,
+            )
+        else:  # legacy_conf_mse
+            total, ray_or_xy, depth_or_z, _scale = legacy_conf_mse_loss(
+                xy_pred=xy_pred,
+                logz_pred=logz_pred,
+                xy_target=xy_t,
+                logz_target=logz_t,
+                conf_target=conf_t,
+                conf_threshold=self._pi3x_legacy_conf_threshold,
+                order=self._pi3x_legacy_order,
+            )
+        return total, ray_or_xy, depth_or_z
+
+    def _compute_point_loss(self, vl_input: BatchFeature) -> dict | None:
+        """Combine PointHead predictions (stashed by ``Eagle2_5_VLCamVLA.extract_feature``)
+        with point-supervision targets into an aux-loss bundle.
+
+        Supports two target channels — ``pi3x.*`` (teacher distillation) and
+        ``gt.*`` (ground-truth pointmaps). With both present, the losses are
+        mixed ``w_gt * L_gt + (1 - w_gt) * L_pi3x`` (``w_gt`` =
+        ``self._point_target_gt_weight``), mirroring openpi's dual-loss mode.
+        With one present, that channel's loss is used directly.
+
+        Returns a dict ``{"total", "xy", "z", "gt"?, "teacher"?}`` (the latter
+        two are detached per-channel totals, present only in dual mode), or
+        ``None`` when supervision is off / no preds / no targets are in the
+        batch — caller treats that as "no aux loss".
+        """
+        if not self._use_pi3x_distill:
+            return None
+        preds = getattr(self.eagle_model, "_pending_pi3x_preds", None)
+        if preds is None:
+            return None
+
+        gt = self._point_loss_for_channel(vl_input, "gt", preds)
+        teacher = self._point_loss_for_channel(vl_input, "pi3x", preds)
+
+        if gt is not None and teacher is not None:
+            w = self._point_target_gt_weight
+            total = w * gt[0] + (1.0 - w) * teacher[0]
+            xy = w * gt[1] + (1.0 - w) * teacher[1]
+            z = w * gt[2] + (1.0 - w) * teacher[2]
+            return {
+                "total": total,
+                "xy": xy,
+                "z": z,
+                "gt": gt[0].detach(),
+                "teacher": teacher[0].detach(),
+            }
+        single = gt if gt is not None else teacher
+        if single is None:
+            return None
+        return {"total": single[0], "xy": single[1], "z": single[2]}
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
@@ -199,6 +332,19 @@ class EagleBackbone(nn.Module):
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
 
-        return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
-        )  # [B, T2, hidden_size]
+        out = {"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+
+        # Compute point-head supervision loss (if configured + targets present).
+        # The caller (GR00T_N1_5.forward) weights and adds it to the action loss.
+        # We also surface the (xy/ray, z/depth) components for logging, plus the
+        # per-channel gt/teacher totals when both are supervised (dual-loss).
+        aux = self._compute_point_loss(vl_input)
+        if aux is not None:
+            out["aux_loss_pi3x"] = aux["total"]
+            out["aux_loss_pi3x_xy"] = aux["xy"].detach()
+            out["aux_loss_pi3x_z"] = aux["z"].detach()
+            if "gt" in aux:
+                out["aux_loss_pi3x_gt"] = aux["gt"]
+                out["aux_loss_pi3x_teacher"] = aux["teacher"]
+
+        return BatchFeature(data=out)  # [B, T2, hidden_size]

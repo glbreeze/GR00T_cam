@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from dataclasses import dataclass, field
-from typing import Tuple
+from pathlib import Path
+from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +37,47 @@ ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
 N_COLOR_CHANNELS = 3
+
+# Substrings used to detect whether a checkpoint already carries trained
+# CamVLA geometry weights. If any param name contains one of these, we skip
+# ``reset_geometry_modules`` so a stage-2 run preserves stage-1's trained
+# ray_embed / cross_view_fusion / point_head.
+_GEOMETRY_KEY_NEEDLES: Tuple[str, ...] = (
+    "ray_embed_module",
+    "cross_view_fusion",
+    "point_head",
+    "pose_inject_blocks",
+)
+
+
+def _checkpoint_has_geometry_keys(local_model_path: str) -> bool:
+    """Scan the safetensors index / single file at ``local_model_path`` for
+    CamVLA geometry parameter names.
+
+    Returns True iff at least one tensor key contains a geometry needle. Falls
+    back to ``False`` (i.e., assume base ckpt, reset on next call) when the
+    checkpoint is in a format we don't recognise -- the worst case is the same
+    behaviour as before this helper existed.
+    """
+    p = Path(local_model_path)
+    keys: Iterable[str]
+
+    index_json = p / "model.safetensors.index.json"
+    if index_json.exists():
+        with index_json.open() as f:
+            keys = json.load(f).get("weight_map", {}).keys()
+    else:
+        single = p / "model.safetensors"
+        if not single.exists():
+            return False
+        try:
+            from safetensors import safe_open  # local import; optional dep at top level
+        except ImportError:
+            return False
+        with safe_open(str(single), framework="pt") as f:
+            keys = list(f.keys())
+
+    return any(any(n in k for n in _GEOMETRY_KEY_NEEDLES) for k in keys)
 
 
 # config
@@ -85,6 +128,14 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+
+        # Outer coefficient for the pi3x distillation loss. ``from_pretrained``
+        # overrides this when distillation is enabled.
+        self.pi3x_loss_weight: float = 1.0
+        # Multiplier on the action (flow-matching) loss. Stage-1 geometry warmup
+        # uses a small value (e.g. 0.1) so the aux distillation loss dominates;
+        # stage-2 keeps it at 1.0 for action-focused fine-tuning.
+        self.action_loss_weight: float = 1.0
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -162,11 +213,37 @@ class GR00T_N1_5(PreTrainedModel):
         self,
         inputs: dict,
     ) -> BatchFeature:
-        import pdb; pdb.set_trace()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
+
+        # Pi3x distillation: fold the backbone-side aux loss into the trainer
+        # loss. Surface action/aux components on the output dict so DualBrainTrainer
+        # can pull them into wandb logs (HF Trainer itself only logs `loss`).
+        # Total = action_loss_weight * action_loss + pi3x_loss_weight * aux_loss.
+        action_only = action_head_outputs["loss"]
+        action_head_outputs["action_loss"] = action_only.detach()
+        # Guard the multiplication so action_loss_weight=1.0 is byte-for-byte
+        # identical to the pre-stage-training graph.
+        total = (
+            action_only
+            if self.action_loss_weight == 1.0
+            else self.action_loss_weight * action_only
+        )
+        if "aux_loss_pi3x" in backbone_outputs:
+            aux = backbone_outputs["aux_loss_pi3x"]
+            total = total + self.pi3x_loss_weight * aux
+            action_head_outputs["aux_loss"] = aux.detach()
+            action_head_outputs["aux_xy_loss"] = backbone_outputs["aux_loss_pi3x_xy"]
+            action_head_outputs["aux_z_loss"] = backbone_outputs["aux_loss_pi3x_z"]
+            # Dual-loss (gt + pi3x): surface the per-channel raw totals so the
+            # mix weight can be tuned from the logs.
+            if "aux_loss_pi3x_gt" in backbone_outputs:
+                action_head_outputs["aux_gt_loss"] = backbone_outputs["aux_loss_pi3x_gt"]
+                action_head_outputs["aux_pi3x_loss"] = backbone_outputs["aux_loss_pi3x_teacher"]
+        action_head_outputs["loss"] = total
+
         return action_head_outputs
 
     def get_action(
@@ -210,16 +287,26 @@ class GR00T_N1_5(PreTrainedModel):
         cross_view_aa_order = kwargs.pop("cross_view_aa_order", "fg")
         cross_view_prope_layer_idx = tuple(kwargs.pop("cross_view_prope_layer_idx", ()) or ())
         cross_view_rope_freq = float(kwargs.pop("cross_view_rope_freq", 100.0))
+        use_pi3x_distill = kwargs.pop("use_pi3x_distill", False)
+        pi3x_loss_weight = float(kwargs.pop("pi3x_loss_weight", 1.0))
+        pi3x_loss_type = kwargs.pop("pi3x_loss_type", "pi3x_local_pointmap")
+        pi3x_ray_loss_weight = float(kwargs.pop("pi3x_ray_loss_weight", 1.0))
+        pi3x_depth_loss_weight = float(kwargs.pop("pi3x_depth_loss_weight", 1.0))
+        pi3x_depth_weighting = kwargs.pop("pi3x_depth_weighting", "pi3x_inverse")
+        point_target_gt_weight = float(kwargs.pop("point_target_gt_weight", 0.5))
+        action_loss_weight = float(kwargs.pop("action_loss_weight", 1.0))
+        trainable_prefixes: Tuple[str, ...] = tuple(kwargs.pop("trainable_prefixes", ()) or ())
         geometry_requested = (
             use_ray_embed
             or cross_view_type != "none"
             or pose_enc_type != "null"
             or bool(cross_view_prope_layer_idx)
+            or use_pi3x_distill
         )
         if geometry_requested and not use_camvla_model:
             raise ValueError(
-                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx "
-                "require use_camvla_model=True"
+                "use_ray_embed / cross_view_type / pose_enc_type / cross_view_prope_layer_idx / "
+                "use_pi3x_distill require use_camvla_model=True"
             )
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
@@ -233,6 +320,16 @@ class GR00T_N1_5(PreTrainedModel):
             f"pose_enc={pose_enc_type} aa_order={cross_view_aa_order!r} "
             f"prope_layer_idx={cross_view_prope_layer_idx} "
             f"rope_freq={cross_view_rope_freq}"
+        )
+        print(
+            f"Pi3x distill: enabled={use_pi3x_distill} loss_type={pi3x_loss_type!r} "
+            f"weight={pi3x_loss_weight} ray_w={pi3x_ray_loss_weight} "
+            f"depth_w={pi3x_depth_loss_weight} depth_weighting={pi3x_depth_weighting!r} "
+            f"gt_weight={point_target_gt_weight} (dual-loss mix when both gt.* and pi3x.* present)"
+        )
+        print(
+            f"Stage weights: action_loss_weight={action_loss_weight} "
+            f"trainable_prefixes={list(trainable_prefixes)}"
         )
 
         # get the current model path being downloaded
@@ -259,6 +356,12 @@ class GR00T_N1_5(PreTrainedModel):
             config.backbone_cfg["cross_view_aa_order"] = cross_view_aa_order
             config.backbone_cfg["cross_view_prope_layer_idx"] = cross_view_prope_layer_idx
             config.backbone_cfg["cross_view_rope_freq"] = cross_view_rope_freq
+            config.backbone_cfg["use_pi3x_distill"] = use_pi3x_distill
+            config.backbone_cfg["pi3x_loss_type"] = pi3x_loss_type
+            config.backbone_cfg["pi3x_ray_loss_weight"] = pi3x_ray_loss_weight
+            config.backbone_cfg["pi3x_depth_loss_weight"] = pi3x_depth_loss_weight
+            config.backbone_cfg["pi3x_depth_weighting"] = pi3x_depth_weighting
+            config.backbone_cfg["point_target_gt_weight"] = point_target_gt_weight
             kwargs["config"] = config
 
         pretrained_model = super().from_pretrained(
@@ -268,8 +371,23 @@ class GR00T_N1_5(PreTrainedModel):
         # HF's _init_weights overrides our zero-init for geometry modules that
         # aren't in the checkpoint. Re-zero them so each enabled module starts
         # as identity (otherwise their large random init produces NaN in bf16).
+        # Skip the reset when the checkpoint already carries trained geometry
+        # weights (stage-2 loading from a stage-1 ckpt) -- otherwise we'd zero
+        # out the very weights we just loaded.
         if use_camvla_model:
-            pretrained_model.backbone.eagle_model.reset_geometry_modules()
+            if _checkpoint_has_geometry_keys(local_model_path):
+                print(
+                    "Geometry modules present in checkpoint -- preserving loaded "
+                    "weights (skipping reset_geometry_modules)."
+                )
+            else:
+                print(
+                    "Geometry modules NOT in checkpoint -- resetting to zero/identity init."
+                )
+                pretrained_model.backbone.eagle_model.reset_geometry_modules()
+
+        pretrained_model.pi3x_loss_weight = pi3x_loss_weight
+        pretrained_model.action_loss_weight = action_loss_weight
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm
@@ -277,6 +395,30 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
+
+        # Stage-1 geometry warmup: freeze everything outside the listed prefixes.
+        # Applied AFTER the per-module set_trainable_parameters calls above so it
+        # is the final word on requires_grad. Matches openpi's ``trainable_prefixes``.
+        if trainable_prefixes:
+            matched = 0
+            total = 0
+            for name, p in pretrained_model.named_parameters():
+                total += 1
+                if any(name.startswith(prefix) for prefix in trainable_prefixes):
+                    p.requires_grad = True
+                    matched += 1
+                else:
+                    p.requires_grad = False
+            print(
+                f"trainable_prefixes={list(trainable_prefixes)} -> "
+                f"{matched}/{total} params trainable"
+            )
+            if matched == 0:
+                raise ValueError(
+                    f"trainable_prefixes={list(trainable_prefixes)} matched 0 parameters. "
+                    "Check the prefix against model.named_parameters() (top-level keys "
+                    "are 'backbone.eagle_model.*' and 'action_head.*')."
+                )
         return pretrained_model
 
 
