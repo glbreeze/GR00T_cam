@@ -90,6 +90,8 @@ Three independent paths share the model but diverge after that:
 
 `gr00t/eval/wrappers/`, `gr00t/eval/simulation.py`, and `gr00t/eval/robot.py` integrate with benchmark envs (LIBERO, RoboCasa, SimplerEnv) and real-robot bridges. Per-benchmark examples live under `examples/{Libero, RoboCasa, SimplerEnv, SO-100, UnitreeG1}/`.
 
+**CamVLA LIBERO eval** uses the client/server path (#2 above), not in-process PyTorch: `examples/Libero/eval/run_libero_eval.py` is a ZMQ client that talks to a backgrounded `scripts/inference_service.py --server` and drives robosuite/mujoco rollouts (task-id sharding, action-chunk replanning, JSON summary). It serializes gr00t-format obs (`state.*`, `video.image/wrist_image`, `annotation.human...`); when `--use-camera-params` is set it also sends `camera.{agent,wrist}_{intrinsic,extrinsic}` computed at the 256×256 LIBERO render resolution — the server's `VideoResizeCameraAware` rescales `K` to the 224×224 model grid. SLURM drivers: `scripts/sbatch_lg/eval_libero.sbatch` (starts server + client in one job) and `submit_eval_libero_4suites.sh` (fan-out over the 4 suites).
+
 ### CamVLA extensions (this fork)
 
 Commit `16cd644` ("setup geometric modules") adds an opt-in **camera-aware** path on top of the N1.5 baseline. It is gated behind flags and falls back to byte-for-byte baseline behavior when disabled. The key pieces:
@@ -122,7 +124,14 @@ python scripts/gr00t_finetune.py --dataset-path <libero-gr00t> --data-config lib
 - `--gt-point-root <cache>` — ground-truth pointmaps from the simulator, emitted on the `gt.*` channel. Mirrors openpi's `gt_point_targets_root` / `*_gtonly` configs.
 - **Both set ⇒ dual-loss:** `aux_loss = w·L(pred, gt) + (1−w)·L(pred, pi3x)`, with `w = --point-target-gt-weight` (default 0.5). Mirrors openpi's `point_target_mix_mode="dual_loss"`. Per-channel `aux_gt_loss` / `aux_pi3x_loss` are logged to wandb alongside the combined `aux_loss`.
 
-Either source requires `--use-camvla-model --use-camera-params --disable-geometric-augs` (the cache is tied to a deterministic 224×224 resize). The loss path lives in `gr00t/model/backbone/eagle_backbone.py::_compute_point_loss`; targets flow through `CameraAwareLeRobotDataset(pi3x_root=, gt_point_root=)`. The LIBERO GT cache (4-suite, frame-aligned) is at `/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_targets_224/libero_cam_v2_aligned`. SLURM drivers: `scripts/sbatch_lg/train_libero_geo_distill_stage{1,2}_gtonly.sbatch` (GT-only) and `train_libero_geo_distill_stage2_dual.sbatch` (dual).
+Either source requires `--use-camvla-model --use-camera-params --disable-geometric-augs` (the cache is tied to a deterministic 224×224 resize). The loss path lives in `gr00t/model/backbone/eagle_backbone.py::_compute_point_loss`; targets flow through `CameraAwareLeRobotDataset(pi3x_root=, gt_point_root=)`. The LIBERO GT cache (4-suite, frame-aligned) is at `/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_targets_224/libero_cam_v2_aligned`.
+
+**Two-stage distillation recipe** (mirrors the openpi `..._stage1`/`..._stage2` configs; SLURM drivers in `scripts/sbatch_lg/`):
+
+- **Stage 1 — geometry warm-up:** geometry modules learn while the rest is held back. `--trainable-prefixes <...>` freezes everything else, `--action-loss-weight 0.1`, point-loss weight `1.0`, constant `lr 2.5e-5`, ~5000 steps.
+- **Stage 2 — action-focused fine-tune:** loads from the stage-1 checkpoint, **full unfreeze** (no `--trainable-prefixes`), `--action-loss-weight 1.0`, point-loss weight `0.05`, cosine LR decay (`--lr-scheduler-type cosine_with_min_lr --learning-rate 2.5e-5 --min-lr-rate 0.1`, i.e. 2.5e-5 → 2.5e-6). GR00T's default `lr 1e-4` is ~4× too hot for this recipe.
+
+Each stage has a `_gtonly` variant (`--gt-point-root` only) and a pi3x/dual variant; `train_libero_geo_distill_stage2_dual.sbatch` is the dual-loss stage 2.
 
 **Dataset conversion for Libero:** `examples/Libero/convert_openpi_lerobot_to_gr00t.py` converts openpi-flavor LeRobot (PNG images) to GR00T-flavor LeRobot (MP4 videos) while preserving the openpi `agent_/wrist_` `extrinsic/intrinsic` columns so CamVLA can consume them later without re-running the conversion. Driver script: `scripts/sbatch_lg/convert_libero_cam_v2.sh`.
 
@@ -131,6 +140,7 @@ Either source requires `--use-camvla-model --use-camera-params --disable-geometr
 - **Fine-tune (baseline):** `python scripts/gr00t_finetune.py --dataset-path <path> [--num-gpus N] [--no-tune_diffusion_model]`
 - **Fine-tune (CamVLA, Libero):** see the four modes in *CamVLA extensions* above; SLURM driver at `scripts/sbatch_lg/train.sh`.
 - **Eval (offline, plot):** `python scripts/eval_policy.py --plot --model_path <path>`
+- **Eval (LIBERO, client/server):** background `scripts/inference_service.py --server --model_path <ckpt> --data_config <cfg> --embodiment-tag <tag>`, then `python examples/Libero/eval/run_libero_eval.py` (add `--use-camera-params` for CamVLA). SLURM: `scripts/sbatch_lg/eval_libero.sbatch`.
 - **Inference server:** `python scripts/inference_service.py --model-path <path> --embodiment-tag <tag>`
 - **Simulation service:** `python scripts/simulation_service.py`
 - **Dataset loader smoke test:** `python scripts/load_dataset.py`

@@ -788,6 +788,22 @@ def _load_libero_configs():
 _libero, _libero_mean_std = _load_libero_configs()
 
 
+def _load_robocasa_configs():
+    """Import RobocasaDataConfig{,MeanStd} from examples/RoboCasa/ lazily to avoid
+    importing user-example code at module load time."""
+    import importlib.util
+    import pathlib
+
+    custom_path = pathlib.Path(__file__).resolve().parents[2] / "examples" / "RoboCasa" / "custom_data_config.py"
+    spec = importlib.util.spec_from_file_location("examples.RoboCasa.custom_data_config", custom_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RobocasaDataConfig(), module.RobocasaDataConfigMeanStd()
+
+
+_robocasa, _robocasa_mean_std = _load_robocasa_configs()
+
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -803,4 +819,6 @@ DATA_CONFIG_MAP = {
     "agibot_genie1": AgibotGenie1DataConfig(),
     "libero": _libero,
     "libero_mean_std": _libero_mean_std,
+    "robocasa": _robocasa,
+    "robocasa_mean_std": _robocasa_mean_std,
 }
