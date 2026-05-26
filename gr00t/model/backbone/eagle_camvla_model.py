@@ -673,6 +673,7 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
         pi3x_num_heads: int = 8,
         pi3x_rope_freq: float = 100.0,
         pi3x_qk_norm: bool = True,
+        pi3x_output_resolution: int = 16,
     ) -> None:
         if cross_view_type not in _VALID_CROSS_VIEW:
             raise ValueError(f"cross_view_type must be one of {_VALID_CROSS_VIEW}, got {cross_view_type!r}")
@@ -728,6 +729,7 @@ class Eagle2_5_VLCamVLA(Eagle2_5_VLForConditionalGeneration):
                 rope_freq=pi3x_rope_freq,
                 qk_norm=pi3x_qk_norm,
                 init_values=0.01,
+                output_resolution=pi3x_output_resolution,
             )
 
         self._geometry_built = True

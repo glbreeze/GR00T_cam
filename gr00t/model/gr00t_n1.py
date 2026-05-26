@@ -294,6 +294,7 @@ class GR00T_N1_5(PreTrainedModel):
         pi3x_depth_loss_weight = float(kwargs.pop("pi3x_depth_loss_weight", 1.0))
         pi3x_depth_weighting = kwargs.pop("pi3x_depth_weighting", "pi3x_inverse")
         point_target_gt_weight = float(kwargs.pop("point_target_gt_weight", 0.5))
+        point_head_output_resolution = int(kwargs.pop("point_head_output_resolution", 16))
         action_loss_weight = float(kwargs.pop("action_loss_weight", 1.0))
         trainable_prefixes: Tuple[str, ...] = tuple(kwargs.pop("trainable_prefixes", ()) or ())
         geometry_requested = (
@@ -325,7 +326,8 @@ class GR00T_N1_5(PreTrainedModel):
             f"Pi3x distill: enabled={use_pi3x_distill} loss_type={pi3x_loss_type!r} "
             f"weight={pi3x_loss_weight} ray_w={pi3x_ray_loss_weight} "
             f"depth_w={pi3x_depth_loss_weight} depth_weighting={pi3x_depth_weighting!r} "
-            f"gt_weight={point_target_gt_weight} (dual-loss mix when both gt.* and pi3x.* present)"
+            f"gt_weight={point_target_gt_weight} output_resolution={point_head_output_resolution} "
+            f"(dual-loss mix when both gt.* and pi3x.* present)"
         )
         print(
             f"Stage weights: action_loss_weight={action_loss_weight} "
@@ -362,6 +364,7 @@ class GR00T_N1_5(PreTrainedModel):
             config.backbone_cfg["pi3x_depth_loss_weight"] = pi3x_depth_loss_weight
             config.backbone_cfg["pi3x_depth_weighting"] = pi3x_depth_weighting
             config.backbone_cfg["point_target_gt_weight"] = point_target_gt_weight
+            config.backbone_cfg["pi3x_output_resolution"] = point_head_output_resolution
             kwargs["config"] = config
 
         pretrained_model = super().from_pretrained(

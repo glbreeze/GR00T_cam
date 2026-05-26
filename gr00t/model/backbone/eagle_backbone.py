@@ -61,6 +61,7 @@ class EagleBackbone(nn.Module):
         pi3x_legacy_conf_threshold: float = 0.1,
         pi3x_legacy_order: int = 2,
         point_target_gt_weight: float = 0.5,
+        pi3x_output_resolution: int = 16,
     ):
         """
         Args:
@@ -120,6 +121,7 @@ class EagleBackbone(nn.Module):
                 prope_layer_idx=cross_view_prope_layer_idx,
                 rope_freq=cross_view_rope_freq,
                 use_pi3x_distill=use_pi3x_distill,
+                pi3x_output_resolution=pi3x_output_resolution,
             )
         else:
             self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)

@@ -80,6 +80,12 @@ if [[ "${EXTRA_TRAIN_ARGS:-}" == *--pi3x-root* ]]; then
     || { echo "Missing pi3x targets root: ${pi3x_path}" >&2; exit 1; }
 fi
 
+if [[ "${EXTRA_TRAIN_ARGS:-}" == *--gt-point-root* ]]; then
+  gt_path=$(echo "${EXTRA_TRAIN_ARGS}" | sed -nE 's/.*--gt-point-root[ =]([^ ]+).*/\1/p')
+  [[ -d "${gt_path}" ]] \
+    || { echo "Missing GT point targets root: ${gt_path}" >&2; exit 1; }
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 # --- assemble training argv ---

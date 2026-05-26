@@ -203,6 +203,14 @@ def _build_target_info(src_info: dict[str, Any], image_size: tuple[int, int, int
     out_info = dict(src_info)
     out_info["features"] = features
     out_info["total_videos"] = n_episodes * len(VIDEO_KEY_MAP)
+    # The openpi PNG source has no video_path (images are an image-dtype column),
+    # so src_info carries video_path=null. GR00T's loader formats this pattern to
+    # locate each MP4 (dataset.py::get_video_path); leaving it null makes
+    # video_path_pattern None -> AttributeError on the first batch. Set the
+    # standard LeRobot v2.1 layout, matching the dirs we write under videos/.
+    out_info["video_path"] = (
+        "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    )
     return out_info
 
 

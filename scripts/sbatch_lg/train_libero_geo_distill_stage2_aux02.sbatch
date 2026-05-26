@@ -1,55 +1,56 @@
 #!/bin/bash
-#SBATCH --job-name=gr00t_libero_geo_distill_s2_gtonly
-#SBATCH --output=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re/slurm-%j.out
-#SBATCH --error=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re/slurm-%j.err
+#SBATCH --job-name=gr00t_libero_geo_distill_s2_aux02
+#SBATCH --output=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_aux02/slurm-%j.out
+#SBATCH --error=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_aux02/slurm-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
 #SBATCH --account=torch_pr_769_tandon_advanced
-#SBATCH --partition=a100_tandon
+#SBATCH --partition=h200_tandon
 #SBATCH --gres=gpu:2
 #SBATCH --export=ALL
 
-# GR00T N1.5 LIBERO -- Stage 2 (action-focused fine-tune), GROUND-TRUTH point
-# supervision.
+# GR00T N1.5 LIBERO -- Stage 2 (action-focused fine-tune on top of Stage 1).
 #
-# Mirrors openpi `pi0_libero_cam_pytorch_prope_ray_view_distill_fullres_4suite_stage2_gtonly`:
-# identical to the pi3x stage-2 recipe (train_libero_geo_distill_stage2.sbatch)
-# except the PointHead is supervised by GROUND-TRUTH pointmaps from the
-# simulator instead of pi3x teacher predictions. Concretely:
+# AUX-WEIGHT ABLATION: identical to train_libero_geo_distill_stage2.sbatch in
+# every respect EXCEPT --pi3x-loss-weight, which is raised 0.05 -> 0.2. This
+# isolates the point/aux loss weight as the single changed variable so the
+# resulting eval delta can be attributed to it (vs. the full-unfreeze / cosine
+# LR schedule that stage 2 also introduces). Motivation: the single-stage
+# geo_distill run (aux=1.0 throughout) is the best result so far, while the
+# stage-2 runs that decay aux to 0.05 regress on libero_10.
+#
+# Mirrors openpi `pi0_libero_cam_pytorch_prope_ray_view_distill_fullres_stage2`
+# otherwise:
 #   * action_loss_weight = 1.0   (action dominates)
-#   * pi3x_loss_weight   = 0.05  (aux point loss kept as a small regulariser)
+#   * pi3x_loss_weight   = 0.2   (ABLATION: up from baseline 0.05)
 #   * full unfreeze (no --trainable-prefixes) -- backbone + DiT + geometry
 #     modules all update together.
 #   * 30000 steps.
 #
-# The GT cache shares the pi3x npz schema ({xy, log_z, conf} per cam per
-# episode), so it flows through the same aux-loss path; only the target source
-# differs (--gt-point-root instead of --pi3x-root).
-#
-# REQUIRES: $STAGE1_CKPT pointing at a Stage 1 (gtonly) checkpoint directory, e.g.
-#     export STAGE1_CKPT=${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_2gpu_b16/checkpoint-5000
+# REQUIRES: $STAGE1_CKPT pointing at a Stage 1 checkpoint directory, e.g.
+#     export STAGE1_CKPT=${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_2gpu_b16/checkpoint-5000
 # The geometry-key scanner in GR00T_N1_5.from_pretrained inspects the safetensors
 # of this checkpoint; finding ray_embed_module/cross_view_fusion/point_head keys
 # skips reset_geometry_modules() and preserves the Stage 1 weights.
 
 set -euo pipefail
 
-mkdir -p /scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re
+mkdir -p /scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_aux02
 
 export REPO_ROOT=/scratch/lg154/Research/GR00T_cam
 
 # --- Stage 1 checkpoint: required, no default (must point at a real ckpt dir) ---
-STAGE1_CKPT=${STAGE1_CKPT:-${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_2gpu_b16/checkpoint-5000}
+STAGE1_CKPT=${STAGE1_CKPT:-${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_2gpu_b16/checkpoint-5000}
 if [[ ! -f "${STAGE1_CKPT}/config.json" ]] \
    || [[ ! -f "${STAGE1_CKPT}/model.safetensors.index.json" && ! -f "${STAGE1_CKPT}/model.safetensors" ]]; then
   echo "ERROR: STAGE1_CKPT does not look like a HF checkpoint: ${STAGE1_CKPT}" >&2
   echo "       Need config.json + model.safetensors(.index.json)." >&2
   exit 1
 fi
-echo "Stage 2 (gtonly) starting from: ${STAGE1_CKPT}"
+echo "Stage 2 (aux=0.2) starting from: ${STAGE1_CKPT}"
 
 # --- env consumed by train_libero.sbatch ---
 export DATASET_PATH=/scratch/lg154/cache/lerobot/glbreeze/libero_cam_v2_gr00t
@@ -64,8 +65,8 @@ export BATCH_SIZE=16
 export NUM_TRAIN_STEPS=30000
 export SAVE_INTERVAL=1000
 
-# --- ground-truth pointmap cache (must match the cache used in Stage 1) ---
-GT_POINT_TARGETS_ROOT=/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_targets_224/libero_cam_v2_aligned
+# --- pi3x distillation cache (must match the cache used in Stage 1) ---
+PI3X_TARGETS_ROOT=/scratch/lg154/.cache/openpi/pi3x_targets_224/libero_cam_v2
 
 # --- CamVLA stack + stage-2 loss weights (NO --trainable-prefixes: full unfreeze) ---
 # LR schedule mirrors openpi's `CosineDecaySchedule(peak_lr=2.5e-5, decay_lr=2.5e-6)`:
@@ -73,6 +74,7 @@ GT_POINT_TARGETS_ROOT=/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_target
 #   * min_lr_rate = 0.1     (decay floor = 10% of peak = 2.5e-6, matches openpi)
 #   * warmup_ratio remains the GR00T default 0.05 -> 1500 / 30000 steps,
 #     close to openpi's 1000 absolute steps.
+# NOTE: only --pi3x-loss-weight differs from the baseline stage-2 script (0.05 -> 0.2).
 export EXTRA_TRAIN_ARGS="\
 --use-camvla-model \
 --use-ray-embed \
@@ -83,19 +85,19 @@ export EXTRA_TRAIN_ARGS="\
 --cross-view-rope-freq 100.0 \
 --use-camera-params \
 --disable-geometric-augs \
---gt-point-root ${GT_POINT_TARGETS_ROOT} \
+--pi3x-root ${PI3X_TARGETS_ROOT} \
 --pi3x-loss-type legacy_conf_mse \
 --action-loss-weight 1.0 \
---pi3x-loss-weight 0.05 \
---learning-rate 2.5e-5 \
+--pi3x-loss-weight 0.2 \
+--learning-rate 1e-4 \
 --lr-scheduler-type cosine_with_min_lr \
---min-lr-rate 0.1"
+--min-lr-rate 0.01"
 
 # --- wandb ---
 export WANDB_ENABLED=true
 export WANDB_PROJECT=gr00t_libero_lg
 export WANDB_ENTITY=NYU-robotics
 
-export EXP_NAME=gr00t_libero_geo_distill_s2_gtonly_re_2gpu_b16
+export EXP_NAME=gr00t_libero_geo_distill_s2_aux02_2gpu_b16
 
 exec bash "${REPO_ROOT}/scripts/sbatch_lg/train_libero.sbatch"

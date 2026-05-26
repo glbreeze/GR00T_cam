@@ -56,6 +56,15 @@ REPLAN_STEPS=${REPLAN_STEPS:-5}
 NUM_STEPS_WAIT=${NUM_STEPS_WAIT:-10}
 SEED=${SEED:-7}
 
+# Fan out this many rollout clients (disjoint task ranges) against the single
+# policy server. LIBERO eval is sim/render-bound, so one client leaves the GPU
+# ~1% utilised and trips the partition's >2h low-util killer. Parallel clients
+# overlap their mujoco sims on CPU + EGL render contexts on the GPU, cutting
+# wall-clock ~Nx (a 10-task suite finishes well under the 2h window) and lifting
+# average GPU util. The zmq.REP server fair-queues across clients (serialised
+# inference, parallel sims). Set NUM_PARALLEL_CLIENTS=1 for the old behavior.
+NUM_PARALLEL_CLIENTS=${NUM_PARALLEL_CLIENTS:-4}
+
 PORT=${PORT:-19200}
 SERVER_START_TIMEOUT=${SERVER_START_TIMEOUT:-900}
 
@@ -68,8 +77,11 @@ SUMMARY_PATH=${LOG_ROOT}/summary/${SLURM_JOB_ID:-manual}.json
 SERVER_LOG=${LOG_ROOT}/logs/server_${SLURM_JOB_ID:-manual}.log
 CLIENT_LOG=${LOG_ROOT}/logs/client_${SLURM_JOB_ID:-manual}.log
 VIDEO_OUT=${LOG_ROOT}/videos/${SLURM_JOB_ID:-manual}
+# Per-shard scratch for the parallel clients; merged back into SUMMARY_PATH.
+SHARD_SUMMARY_ROOT=${LOG_ROOT}/summary/shards_${SLURM_JOB_ID:-manual}
 
-mkdir -p "$(dirname "${SUMMARY_PATH}")" "${VIDEO_OUT}" "$(dirname "${SERVER_LOG}")"
+mkdir -p "$(dirname "${SUMMARY_PATH}")" "${VIDEO_OUT}" "$(dirname "${SERVER_LOG}")" \
+         "${SHARD_SUMMARY_ROOT}"
 
 # ---- ckpt sanity ----
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
@@ -149,31 +161,116 @@ while ! python -c "import socket; s=socket.socket(); s.settimeout(0.5); s.connec
 done
 echo "Server is up on tcp://127.0.0.1:${PORT}"
 
-# -------- 2. run the LIBERO client --------
+# -------- 2. run the LIBERO clients (sharded across the suite's tasks) --------
 CAMERA_FLAG=()
 if [[ "${USE_CAMERA_PARAMS}" == "true" ]]; then
   CAMERA_FLAG+=("--use-camera-params")
 fi
 
-echo "Starting LIBERO client (log: ${CLIENT_LOG})"
-(
+# Resolve the task window: TASK_ID_END=-1 means "all tasks in the suite". We
+# query the benchmark for n_tasks and shard [TASK_ID_START, end) across clients.
+n_tasks=$(
   export PYTHONPATH="${REPO_ROOT}:${OPENPI_ROOT}/third_party/libero${PYTHONPATH:+:${PYTHONPATH}}"
-  cd "${REPO_ROOT}"
-  PYTHONUNBUFFERED=1 "${OPENPI_ROOT}/.venv/bin/python" -u examples/Libero/eval/run_libero_eval.py \
-    --host localhost \
-    --port "${PORT}" \
-    --model-name "${MODEL_NAME}" \
-    --task-suite-name "${SUITE_NAME}" \
-    --num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
-    --replan-steps "${REPLAN_STEPS}" \
-    --num-steps-wait "${NUM_STEPS_WAIT}" \
-    --task-id-start "${TASK_ID_START}" \
-    --task-id-end "${TASK_ID_END}" \
-    --seed "${SEED}" \
-    --video-out-path "${VIDEO_OUT}" \
-    --summary-out-path "${SUMMARY_PATH}" \
-    "${CAMERA_FLAG[@]}"
-) 2>&1 | tee "${CLIENT_LOG}"
+  "${OPENPI_ROOT}/.venv/bin/python" -c "
+import contextlib, io
+from libero.libero import benchmark
+with contextlib.redirect_stdout(io.StringIO()):
+    n = benchmark.get_benchmark_dict()['${SUITE_NAME}']().n_tasks
+print(n)
+"
+)
+[[ "${n_tasks}" =~ ^[0-9]+$ && "${n_tasks}" -gt 0 ]] \
+  || { echo "Bad task count for ${SUITE_NAME}: ${n_tasks}" >&2; exit 1; }
+
+range_start=${TASK_ID_START}
+range_end=${TASK_ID_END}
+(( range_end < 0 )) && range_end=${n_tasks}
+(( range_end > n_tasks )) && range_end=${n_tasks}
+span=$(( range_end - range_start ))
+(( span > 0 )) || { echo "Empty task range [${range_start}, ${range_end})" >&2; exit 1; }
+
+n_clients=${NUM_PARALLEL_CLIENTS}
+(( n_clients > span )) && n_clients=${span}
+echo "Suite ${SUITE_NAME} has ${n_tasks} tasks; evaluating [${range_start}, ${range_end}) across ${n_clients} client(s)."
+
+client_pids=()
+for i in $(seq 0 $((n_clients - 1))); do
+  task_start=$(( range_start + i * span / n_clients ))
+  task_end=$(( range_start + (i + 1) * span / n_clients ))
+  (( task_start >= task_end )) && continue
+
+  shard_video="${VIDEO_OUT}/shard_${i}"
+  shard_summary="${SHARD_SUMMARY_ROOT}/shard_${i}.json"
+  shard_log="${LOG_ROOT}/logs/client_${SLURM_JOB_ID:-manual}_shard${i}.log"
+  mkdir -p "${shard_video}"
+
+  echo "Client ${i}: tasks [${task_start}, ${task_end})  (log: ${shard_log})"
+  (
+    export PYTHONPATH="${REPO_ROOT}:${OPENPI_ROOT}/third_party/libero${PYTHONPATH:+:${PYTHONPATH}}"
+    cd "${REPO_ROOT}"
+    PYTHONUNBUFFERED=1 "${OPENPI_ROOT}/.venv/bin/python" -u examples/Libero/eval/run_libero_eval.py \
+      --host localhost \
+      --port "${PORT}" \
+      --model-name "${MODEL_NAME}" \
+      --task-suite-name "${SUITE_NAME}" \
+      --num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
+      --replan-steps "${REPLAN_STEPS}" \
+      --num-steps-wait "${NUM_STEPS_WAIT}" \
+      --task-id-start "${task_start}" \
+      --task-id-end "${task_end}" \
+      --seed "${SEED}" \
+      --video-out-path "${shard_video}" \
+      --summary-out-path "${shard_summary}" \
+      "${CAMERA_FLAG[@]}"
+  ) > "${shard_log}" 2>&1 &
+  client_pids+=("$!")
+done
+
+client_rc=0
+for pid in "${client_pids[@]}"; do
+  wait "${pid}" || client_rc=$?
+done
+
+# Concatenate shard logs into the canonical client log for convenience.
+cat "${LOG_ROOT}/logs/client_${SLURM_JOB_ID:-manual}_shard"*.log > "${CLIENT_LOG}" 2>/dev/null || true
+
+(( client_rc == 0 )) || { echo "At least one client failed (rc=${client_rc})" >&2; exit "${client_rc}"; }
+
+# -------- 3. merge shard summaries -> SUMMARY_PATH --------
+"${OPENPI_ROOT}/.venv/bin/python" - "${SHARD_SUMMARY_ROOT}" "${SUMMARY_PATH}" <<'PY'
+import json, pathlib, sys
+
+shard_dir = pathlib.Path(sys.argv[1])
+out_path = pathlib.Path(sys.argv[2])
+paths = sorted(shard_dir.glob("shard_*.json"))
+if not paths:
+    raise SystemExit(f"No shard summaries in {shard_dir}")
+
+summaries = [json.loads(p.read_text()) for p in paths]
+records = [r for s in summaries for r in s.get("records", [])]
+total_eps = sum(int(s.get("total_episodes", 0)) for s in summaries)
+total_succ = sum(int(s.get("total_successes", 0)) for s in summaries)
+first = summaries[0]
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps({
+    "model_name": first.get("model_name"),
+    "task_suite_name": first.get("task_suite_name"),
+    "task_range": [
+        min(s["task_range"][0] for s in summaries),
+        max(s["task_range"][1] for s in summaries),
+    ],
+    "num_trials_per_task": first.get("num_trials_per_task"),
+    "use_camera_params": first.get("use_camera_params"),
+    "replan_steps": first.get("replan_steps"),
+    "total_episodes": total_eps,
+    "total_successes": total_succ,
+    "total_success_rate": total_succ / total_eps if total_eps else 0.0,
+    "records": sorted(records, key=lambda r: r.get("task_id", 0)),
+    "shard_summaries": [str(p) for p in paths],
+}, indent=2) + "\n")
+print(out_path)
+PY
 
 echo "Eval complete."
 echo "Summary: ${SUMMARY_PATH}"

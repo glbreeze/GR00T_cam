@@ -8,7 +8,7 @@
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
 #SBATCH --account=torch_pr_769_tandon_advanced
-#SBATCH --partition=h200_tandon
+#SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:2
 #SBATCH --export=ALL
 
@@ -40,7 +40,12 @@ export BASE_MODEL_PATH=nvidia/GR00T-N1.5-3B
 
 export NUM_GPUS=2
 export NUM_WORKERS=16
-export BATCH_SIZE=8
+# Per-device batch. 16 x NUM_GPUS=2 = global 32, matching GR00T's default global
+# batch (the LR 1e-4 default is tuned for it). Empirically peaks ~24 GB / 80 GB
+# on an A100 full 3B finetune, so it fits A100-80GB and H200 with wide headroom.
+# (openpi's pi0_robocasa24_all24_baseline uses global 8; we intentionally follow
+# GR00T's recipe here rather than strict openpi batch parity.)
+export BATCH_SIZE=16
 export NUM_TRAIN_STEPS=30000
 export SAVE_INTERVAL=1000
 

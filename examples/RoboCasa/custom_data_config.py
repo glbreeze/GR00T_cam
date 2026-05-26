@@ -77,8 +77,10 @@ class RobocasaDataConfig(BaseDataConfig):
         "state.gripper_qpos",
     ]
     # RoboCasa action is a flat 12-dim vector (absolute eef targets, not deltas).
-    # base_motion (dims 0:4) and control_mode (dim 4) are constant in the human
-    # demos -> they normalize to 0 (StateActionTransform masks zero-range dims).
+    # Only control_mode (dim 4) is truly constant in the human demos -> it has
+    # zero range and min_max maps it to 0 (StateActionTransform sets min==max
+    # dims to 0). base_motion (dims 0:4) is *not* constant -- it has small but
+    # nonzero ranges, so min_max rescales those small base motions to [-1, 1].
     action_keys = [
         "action.base_motion",
         "action.control_mode",

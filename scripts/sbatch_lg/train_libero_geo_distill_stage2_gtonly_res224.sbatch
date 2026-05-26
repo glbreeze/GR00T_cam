@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=gr00t_libero_geo_distill_s2_gtonly
-#SBATCH --output=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re/slurm-%j.out
-#SBATCH --error=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re/slurm-%j.err
+#SBATCH --job-name=gr00t_libero_geo_distill_s2_gtonly_res224
+#SBATCH --output=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re_res224/slurm-%j.out
+#SBATCH --error=/scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re_res224/slurm-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -30,19 +30,19 @@
 # differs (--gt-point-root instead of --pi3x-root).
 #
 # REQUIRES: $STAGE1_CKPT pointing at a Stage 1 (gtonly) checkpoint directory, e.g.
-#     export STAGE1_CKPT=${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_2gpu_b16/checkpoint-5000
+#     export STAGE1_CKPT=${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_res224/checkpoint-5000
 # The geometry-key scanner in GR00T_N1_5.from_pretrained inspects the safetensors
 # of this checkpoint; finding ray_embed_module/cross_view_fusion/point_head keys
 # skips reset_geometry_modules() and preserves the Stage 1 weights.
 
 set -euo pipefail
 
-mkdir -p /scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re
+mkdir -p /scratch/lg154/Research/GR00T_cam/logs/gr00t_libero_geo_distill_s2_gtonly_re_res224
 
 export REPO_ROOT=/scratch/lg154/Research/GR00T_cam
 
 # --- Stage 1 checkpoint: required, no default (must point at a real ckpt dir) ---
-STAGE1_CKPT=${STAGE1_CKPT:-${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_2gpu_b16/checkpoint-5000}
+STAGE1_CKPT=${STAGE1_CKPT:-${REPO_ROOT}/checkpoints/gr00t_libero_geo_distill_s1_gtonly_res224/checkpoint-5000}
 if [[ ! -f "${STAGE1_CKPT}/config.json" ]] \
    || [[ ! -f "${STAGE1_CKPT}/model.safetensors.index.json" && ! -f "${STAGE1_CKPT}/model.safetensors" ]]; then
   echo "ERROR: STAGE1_CKPT does not look like a HF checkpoint: ${STAGE1_CKPT}" >&2
@@ -65,7 +65,7 @@ export NUM_TRAIN_STEPS=30000
 export SAVE_INTERVAL=1000
 
 # --- ground-truth pointmap cache (must match the cache used in Stage 1) ---
-GT_POINT_TARGETS_ROOT=/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_targets_224/libero_cam_v2_aligned
+GT_POINT_TARGETS_ROOT=/scratch/lg154/cache/point_targets_npy/libero_gt_cam_v2_aligned
 
 # --- CamVLA stack + stage-2 loss weights (NO --trainable-prefixes: full unfreeze) ---
 # LR schedule mirrors openpi's `CosineDecaySchedule(peak_lr=2.5e-5, decay_lr=2.5e-6)`:
@@ -73,8 +73,10 @@ GT_POINT_TARGETS_ROOT=/scratch/yp2841/geometry-vla/.cache/openpi/gt_point_target
 #   * min_lr_rate = 0.1     (decay floor = 10% of peak = 2.5e-6, matches openpi)
 #   * warmup_ratio remains the GR00T default 0.05 -> 1500 / 30000 steps,
 #     close to openpi's 1000 absolute steps.
+# res224: lr/scheduler overrides removed -> GR00T default (start lr 1e-4, cosine, warmup 0.05), matching the baseline.
 export EXTRA_TRAIN_ARGS="\
 --use-camvla-model \
+--point-head-output-resolution 224 \
 --use-ray-embed \
 --cross-view-type standard \
 --pose-enc-type prope \
@@ -86,16 +88,13 @@ export EXTRA_TRAIN_ARGS="\
 --gt-point-root ${GT_POINT_TARGETS_ROOT} \
 --pi3x-loss-type legacy_conf_mse \
 --action-loss-weight 1.0 \
---pi3x-loss-weight 0.05 \
---learning-rate 2.5e-5 \
---lr-scheduler-type cosine_with_min_lr \
---min-lr-rate 0.1"
+--pi3x-loss-weight 0.05"
 
 # --- wandb ---
 export WANDB_ENABLED=true
 export WANDB_PROJECT=gr00t_libero_lg
 export WANDB_ENTITY=NYU-robotics
 
-export EXP_NAME=gr00t_libero_geo_distill_s2_gtonly_re_2gpu_b16
+export EXP_NAME=gr00t_libero_geo_distill_s2_gtonly_re_res224
 
 exec bash "${REPO_ROOT}/scripts/sbatch_lg/train_libero.sbatch"

@@ -63,9 +63,18 @@ class CameraAwareLeRobotDataset(LeRobotSingleDataset):
         pi3x_root: str | None = None,
         gt_point_root: str | None = None,
         pi3x_cam_subdirs: tuple[str, ...] | None = None,
+        point_target_resolution: int = 16,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        if point_target_resolution not in (16, 224):
+            raise ValueError(
+                f"point_target_resolution must be 16 or 224, got {point_target_resolution}."
+            )
+        # 16 -> avg-pool the cache frame to the 16x16 patch grid (PointHead Linear
+        # head); 224 -> keep the full-res frame (PointHead ConvHead upsampler).
+        # Must match --point-head-output-resolution on the model side.
+        self._point_target_resolution = int(point_target_resolution)
         self._available_camera_columns = self._detect_camera_columns()
         self._camera_delta_indices = self._resolve_camera_delta_indices()
 
@@ -192,6 +201,37 @@ class CameraAwareLeRobotDataset(LeRobotSingleDataset):
         # (V, patch_h, kh, patch_w, kw, C) -> mean over (kh, kw)
         return arr.reshape(V, patch_h, kh, patch_w, kw, C).mean(axis=(2, 4))
 
+    @staticmethod
+    def _load_cam_frame(
+        cam_dir: pathlib.Path, trajectory_id: int, base_index: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load one frame's (xy, log_z, conf) for a single cam.
+
+        Two on-disk layouts are supported, preferred in this order:
+
+        * **Uncompressed per-array ``.npy``** at
+          ``{cam_dir}/episode_{NNNNNN}/{xy,log_z,conf}.npy``. Opened with
+          ``mmap_mode='r'``, so indexing ``[base_index]`` touches only that
+          frame's pages — ~one frame of I/O, no decompression.
+        * **Legacy per-episode ``.npz``** at
+          ``{cam_dir}/episode_{NNNNNN}.npz``. ``mmap_mode`` is *ignored* for
+          (compressed) npz, so this fully decompresses the whole episode per
+          frame — kept only for backward compatibility; prefer the .npy cache.
+        """
+        ep = f"episode_{int(trajectory_id):06d}"
+        npy_dir = cam_dir / ep
+        if npy_dir.is_dir():
+            def _one(name: str) -> np.ndarray:
+                arr = np.load(npy_dir / f"{name}.npy", mmap_mode="r")
+                return np.asarray(arr[base_index], dtype=np.float32)
+            return _one("xy"), _one("log_z"), _one("conf")
+        with np.load(cam_dir / f"{ep}.npz", mmap_mode="r") as f:
+            return (
+                np.asarray(f["xy"][base_index], dtype=np.float32),
+                np.asarray(f["log_z"][base_index], dtype=np.float32),
+                np.asarray(f["conf"][base_index], dtype=np.float32),
+            )
+
     def _load_point_targets(
         self,
         root: pathlib.Path | None,
@@ -203,33 +243,48 @@ class CameraAwareLeRobotDataset(LeRobotSingleDataset):
         """Load one frame of (xy, log_z, conf) for each available cam under ``root``.
 
         Returns ``None`` if no cams are available. Otherwise emits three arrays
-        of shape ``(V, patch_h, patch_w, *)`` stacked over ``subdirs``, keyed
+        of shape ``(V, R, R, *)`` stacked over ``subdirs``, keyed
         ``{prefix}.{xy,logz,conf}`` (``prefix`` is ``"pi3x"`` for the teacher
-        cache, ``"gt"`` for the ground-truth cache). If the cache is at full
-        image resolution (e.g., 224x224), each (kh, kw) block is averaged into
-        one patch — same convention as openpi's ``cache_pi3x_targets.py`` at
-        ``output_resolution=16``.
+        cache, ``"gt"`` for the ground-truth cache).
 
-        Uses ``mmap_mode='r'``; only the requested row is materialised, so
-        repeated calls into the same episode are cheap once the page cache
-        warms up.
+        ``R`` is set by ``point_target_resolution``: when 16, each full-res frame
+        is avg-pooled to the 16x16 patch grid (matching openpi's
+        ``output_resolution=16``); when 224, the full-res frame is kept as-is
+        (matching openpi's ``output_resolution=224``). The pooling/keep choice
+        must match the PointHead's output resolution.
         """
         if not subdirs:
             return None
 
         xy_views, logz_views, conf_views = [], [], []
         for sub in subdirs:
-            npz_path = root / sub / f"episode_{int(trajectory_id):06d}.npz"
-            with np.load(npz_path, mmap_mode="r") as f:
-                xy_views.append(np.asarray(f["xy"][base_index], dtype=np.float32))
-                logz_views.append(np.asarray(f["log_z"][base_index], dtype=np.float32))
-                conf_views.append(np.asarray(f["conf"][base_index], dtype=np.float32))
+            xy, logz, conf = self._load_cam_frame(root / sub, trajectory_id, base_index)
+            xy_views.append(xy)
+            logz_views.append(logz)
+            conf_views.append(conf)
 
-        patch_h, patch_w = self.PI3X_TARGET_PATCH
+        xy = np.stack(xy_views, axis=0)      # (V, H, W, 2)
+        logz = np.stack(logz_views, axis=0)  # (V, H, W, 1)
+        conf = np.stack(conf_views, axis=0)  # (V, H, W, 1)
+
+        if self._point_target_resolution == 16:
+            patch_h, patch_w = self.PI3X_TARGET_PATCH
+            xy = self._avg_pool_to_patch(xy, patch_h, patch_w)
+            logz = self._avg_pool_to_patch(logz, patch_h, patch_w)
+            conf = self._avg_pool_to_patch(conf, patch_h, patch_w)
+        else:
+            R = self._point_target_resolution
+            H, W = xy.shape[1], xy.shape[2]
+            if (H, W) != (R, R):
+                raise ValueError(
+                    f"point_target_resolution={R} but {prefix} cache frame is "
+                    f"({H}, {W}); full-res mode needs a cache at that resolution."
+                )
+
         return {
-            f"{prefix}.xy":   self._avg_pool_to_patch(np.stack(xy_views, axis=0),   patch_h, patch_w),
-            f"{prefix}.logz": self._avg_pool_to_patch(np.stack(logz_views, axis=0), patch_h, patch_w),
-            f"{prefix}.conf": self._avg_pool_to_patch(np.stack(conf_views, axis=0), patch_h, patch_w),
+            f"{prefix}.xy": xy,
+            f"{prefix}.logz": logz,
+            f"{prefix}.conf": conf,
         }
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:

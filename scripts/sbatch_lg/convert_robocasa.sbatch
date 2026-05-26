@@ -8,7 +8,7 @@
 #SBATCH --mem=128G
 #SBATCH --time=08:00:00
 #SBATCH --account=torch_pr_769_tandon_advanced
-#SBATCH --partition=cpu
+#SBATCH --cpus-per-task=4
 #SBATCH --export=ALL
 #
 # Convert openpi-flavor RoboCasa LeRobot (PNG images) -> GR00T-flavor (MP4 videos).
@@ -25,7 +25,9 @@ source /scratch/lg154/miniconda3/etc/profile.d/conda.sh
 conda activate /scratch/lg154/conda-envs/gr00t
 
 REPO_ROOT=${REPO_ROOT:-/scratch/lg154/Research/GR00T_cam}
-SRC=${SRC:-/scratch/lg154/cache/lerobot/robocasa24/all24_human_camaware}
+# openpi-flavor source (ROBOCASA24_LEROBOT_ROOT from pi0_robocasa24_all24_baseline);
+# world-readable under yz11445's scratch. Override SRC to a local copy if preferred.
+SRC=${SRC:-/scratch/yz11445/robocasa24/all24_human_camaware}
 DST=${DST:-/scratch/lg154/cache/lerobot/robocasa24/all24_human_camaware_gr00t}
 NUM_WORKERS=${NUM_WORKERS:-${SLURM_CPUS_PER_TASK:-16}}
 CRF=${CRF:-23}

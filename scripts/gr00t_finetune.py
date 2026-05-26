@@ -143,6 +143,16 @@ class ArgsConfig:
     PointHead loss path and all --pi3x-loss-* knobs. Requires --use-camvla-model,
     --use-camera-params, and --disable-geometric-augs."""
 
+    pi3x_cam_subdirs: tuple[str, ...] | None = None
+    """Per-camera subdir names under --pi3x-root / --gt-point-root, in video order
+    (the first must align with video.image, the second with video.wrist_image).
+    Defaults to CameraAwareLeRobotDataset.PI3X_CAM_SUBDIRS = ("agent", "wrist"),
+    which matches the Libero caches. RoboCasa's GT cache names the front view
+    "base", so pass ``--pi3x-cam-subdirs base wrist`` there — otherwise only the
+    matching subdir is detected and the front-camera targets are silently dropped
+    (a non-matching name is skipped without error). No effect unless --pi3x-root
+    or --gt-point-root is set."""
+
     point_target_gt_weight: float = 0.5
     """Dual-loss mix weight when BOTH --pi3x-root and --gt-point-root are set:
     aux_loss = w * L(pred, gt) + (1 - w) * L(pred, pi3x), with w this value in
@@ -157,6 +167,14 @@ class ArgsConfig:
     """Which pi3x loss to apply. 'pi3x_local_pointmap' (default) matches openpi's
     stage-1/2 training. 'legacy_conf_mse' is a simpler hard-confidence-gated L2
     that skips the per-sample scale alignment."""
+
+    point_head_output_resolution: Literal[16, 224] = 16
+    """PointHead output resolution. 16 (default): per-patch (16x16) prediction via
+    a Linear head, paired with avg-pooled 16x16 targets. 224: full-resolution
+    prediction via a Pi3X-style ConvHead upsampler, paired with un-pooled 224x224
+    targets — matches openpi's ``aux_point_head.output_resolution=224``. Must agree
+    with the on-disk target resolution; the dataset pools (16) or keeps full-res
+    (224) to match. No effect unless --pi3x-root or --gt-point-root is set."""
 
     pi3x_ray_loss_weight: float = 1.0
     """Ray-direction (xy) loss weight inside pi3x_local_pointmap."""
@@ -360,6 +378,11 @@ def main(config: ArgsConfig):
             dataset_kwargs["pi3x_root"] = config.pi3x_root
         if config.gt_point_root is not None:
             dataset_kwargs["gt_point_root"] = config.gt_point_root
+        if config.pi3x_cam_subdirs is not None:
+            dataset_kwargs["pi3x_cam_subdirs"] = config.pi3x_cam_subdirs
+        # Target resolution must agree with the PointHead: 16 -> avg-pool to the
+        # 16x16 patch grid; 224 -> keep full-res targets (no pooling).
+        dataset_kwargs["point_target_resolution"] = config.point_head_output_resolution
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
@@ -438,6 +461,7 @@ def main(config: ArgsConfig):
         pi3x_depth_loss_weight=config.pi3x_depth_loss_weight,
         pi3x_depth_weighting=config.pi3x_depth_weighting,
         point_target_gt_weight=config.point_target_gt_weight,
+        point_head_output_resolution=config.point_head_output_resolution,
         action_loss_weight=config.action_loss_weight,
         trainable_prefixes=config.trainable_prefixes,
     )

@@ -9,10 +9,17 @@ Output convention matches pi3x's `point_head`:
     z:  (..., 1)  log-depth. Consumer reconstructs 3D local points as
                   ``(xy * exp(z), exp(z))``.
 
-Only the patch-level (``output_resolution=16``) path is ported here, since
-that's the only target cache we currently consume on the GR00T side.
-Final ``linear_out`` is zero-init so step-0 output is identity-zero,
-preserving baseline behavior before the head is trained.
+Two output modes, selected via ``output_resolution`` (matches openpi's
+``PointHead``):
+
+* ``16`` (default): per-patch (xy, log_z) via a single zero-init ``Linear``.
+  Cheap. Pair with the avg-pooled 16x16 patch targets.
+* ``224``: full-resolution (xy, log_z) via a Pi3X-style ConvHead upsampler
+  (16->32->64->128 ConvTranspose2d stages, bilinear to 224, then per-output
+  Conv2d). Pair with the full-res 224x224 targets (no pooling).
+
+In both modes the final output layer is zero-init so step-0 head output is
+identity-zero, preserving baseline behavior before the head is trained.
 """
 
 from __future__ import annotations
@@ -161,6 +168,64 @@ class _Block(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Full-resolution upsampler (output_resolution=224 path)
+# ---------------------------------------------------------------------------
+
+
+class _ConvHeadUpsampler(nn.Module):
+    """Pi3X-ConvHead-style 16x16 -> 224x224 upsampler with separate xy / z heads.
+
+    Ported from ``openpi/.../layers/point_head.py::_ConvHeadUpsampler`` (no
+    UV-conditioning — square images). Three ConvTranspose2d stages take the
+    16x16 patch grid to 128x128, then a bilinear resize to ``target_hw``, then
+    per-output Conv2d heads. The final per-output Conv2d is zero-init so the
+    head contributes zero at step 0, preserving the pretrained baseline.
+    """
+
+    def __init__(
+        self,
+        dim_in: int,
+        target_hw: int = 224,
+        dim_upsample: Tuple[int, ...] = (256, 128, 64),
+        last_conv_channels: int = 32,
+    ):
+        super().__init__()
+        self.target_hw = target_hw
+
+        in_chs = (dim_in, *dim_upsample[:-1])
+        self.upsample_blocks = nn.ModuleList()
+        for in_ch, out_ch in zip(in_chs, dim_upsample):
+            self.upsample_blocks.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, padding_mode="replicate"),
+                )
+            )
+
+        last_dim = dim_upsample[-1]
+
+        def _make_output_block(out_dim: int) -> nn.Sequential:
+            block = nn.Sequential(
+                nn.Conv2d(last_dim, last_conv_channels, kernel_size=3, padding=1, padding_mode="replicate"),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(last_conv_channels, out_dim, kernel_size=1),
+            )
+            nn.init.zeros_(block[-1].weight)
+            nn.init.zeros_(block[-1].bias)
+            return block
+
+        self.xy_head = _make_output_block(2)
+        self.z_head = _make_output_block(1)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        # x: (BV, dim_in, 16, 16)
+        for block in self.upsample_blocks:
+            x = block(x)
+        x = F.interpolate(x, size=(self.target_hw, self.target_hw), mode="bilinear", align_corners=False)
+        return self.xy_head(x), self.z_head(x)
+
+
+# ---------------------------------------------------------------------------
 # PointHead
 # ---------------------------------------------------------------------------
 
@@ -170,8 +235,10 @@ class PointHead(nn.Module):
 
     Input  ``tokens``: ``(B, V, P, D_in)`` features after cross-view fusion,
         where ``P = patch_h * patch_w``.
-    Output ``xy``:     ``(B, V, P, 2)`` — ray direction in camera frame.
-            ``z``:      ``(B, V, P, 1)`` — log-depth.
+    Output ``xy``:     ``(B, V, P_out, 2)`` — ray direction in camera frame.
+            ``z``:      ``(B, V, P_out, 1)`` — log-depth.
+            ``P_out = patch_h*patch_w`` when ``output_resolution == 16``, else
+            ``output_resolution ** 2``.
     """
 
     def __init__(
@@ -186,6 +253,7 @@ class PointHead(nn.Module):
         rope_freq: float = 100.0,
         qk_norm: bool = True,
         init_values: float | None = 0.01,
+        output_resolution: int = 16,
     ):
         super().__init__()
         if hidden_dim % (num_heads * 4) != 0:
@@ -193,8 +261,11 @@ class PointHead(nn.Module):
                 f"hidden_dim ({hidden_dim}) must be divisible by num_heads*4 "
                 f"({num_heads * 4}) for 2D RoPE."
             )
+        if output_resolution not in (16, 224):
+            raise ValueError(f"output_resolution must be 16 or 224, got {output_resolution}.")
         self.patch_h = patch_h
         self.patch_w = patch_w
+        self.output_resolution = output_resolution
 
         self.input_proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
 
@@ -216,12 +287,21 @@ class PointHead(nn.Module):
         )
 
         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-        self.linear_out = nn.Linear(hidden_dim, 3)
+        if output_resolution == 16:
+            self.linear_out = nn.Linear(hidden_dim, 3)
+        else:
+            self.upsampler = _ConvHeadUpsampler(dim_in=hidden_dim, target_hw=output_resolution)
         self._zero_init_output()
 
     def _zero_init_output(self) -> None:
-        nn.init.zeros_(self.linear_out.weight)
-        nn.init.zeros_(self.linear_out.bias)
+        """Zero the final output layer so step-0 head output is exactly zero."""
+        if self.output_resolution == 16:
+            nn.init.zeros_(self.linear_out.weight)
+            nn.init.zeros_(self.linear_out.bias)
+        else:
+            for head in (self.upsampler.xy_head, self.upsampler.z_head):
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
 
     def reset_to_zero(self) -> None:
         """Re-initialise every parameter to safe defaults, then zero ``linear_out``.
@@ -239,9 +319,7 @@ class PointHead(nn.Module):
         activations.
         """
         for m in self.modules():
-            if isinstance(m, nn.Linear):
-                m.reset_parameters()
-            elif isinstance(m, nn.LayerNorm):
+            if isinstance(m, (nn.Linear, nn.LayerNorm, nn.Conv2d, nn.ConvTranspose2d)):
                 m.reset_parameters()
 
         # LayerScale gates: small constant (matches the constructor's
@@ -271,7 +349,18 @@ class PointHead(nn.Module):
             x = blk(x, pos=pos)
 
         x = self.norm(x)
-        out = self.linear_out(x)  # (BV, P, 3)
-        xy = out[..., :2].reshape(B, V, P, 2)
-        z = out[..., 2:3].reshape(B, V, P, 1)
+
+        if self.output_resolution == 16:
+            out = self.linear_out(x)  # (BV, P, 3)
+            xy = out[..., :2].reshape(B, V, P, 2)
+            z = out[..., 2:3].reshape(B, V, P, 1)
+            return xy, z
+
+        # Full-res path: reshape patch tokens to a 2D feature map and upsample.
+        # row-major (patch_h, patch_w) order, matching the target's (H, W) flatten.
+        x_2d = x.permute(0, 2, 1).reshape(B * V, -1, self.patch_h, self.patch_w)
+        xy_full, z_full = self.upsampler(x_2d)  # (BV, 2, R, R), (BV, 1, R, R)
+        r = self.output_resolution
+        xy = xy_full.permute(0, 2, 3, 1).reshape(B, V, r * r, 2)
+        z = z_full.permute(0, 2, 3, 1).reshape(B, V, r * r, 1)
         return xy, z
