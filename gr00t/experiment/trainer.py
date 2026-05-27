@@ -137,24 +137,70 @@ class DualBrainTrainer(transformers.Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
-            optimizer_grouped_parameters = [
-                {
+
+            # Optional separate LR for the LLM backbone. When set (via
+            # --llm-learning-rate, stashed on args by gr00t_finetune.py), the LLM
+            # params get their own param group(s) at that LR while everything else
+            # keeps args.learning_rate. None => single-LR baseline behavior.
+            llm_lr = getattr(self.args, "llm_learning_rate", None)
+
+            def _is_llm(name: str) -> bool:
+                return "eagle_model.language_model" in name
+
+            def _group(decay: bool, llm: bool) -> dict:
+                in_decay = (lambda n: n in decay_parameters) if decay else (lambda n: n not in decay_parameters)
+                g = {
                     "params": [
                         p
                         for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
+                        if p.requires_grad and in_decay(n) and (_is_llm(n) == llm)
                     ],
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
-            ]
+                    "weight_decay": self.args.weight_decay if decay else 0.0,
+                }
+                if llm and llm_lr is not None:
+                    g["lr"] = llm_lr
+                return g
+
+            if llm_lr is not None and llm_lr > 0:
+                optimizer_grouped_parameters = [
+                    _group(decay=True, llm=False),
+                    _group(decay=False, llm=False),
+                    _group(decay=True, llm=True),
+                    _group(decay=False, llm=True),
+                ]
+                # Drop empty groups (e.g. LLM frozen): torch errors only if ALL
+                # groups are empty, but empty groups are noise — filter them.
+                optimizer_grouped_parameters = [
+                    grp for grp in optimizer_grouped_parameters if len(grp["params"]) > 0
+                ]
+                n_llm = sum(
+                    p.numel()
+                    for n, p in opt_model.named_parameters()
+                    if p.requires_grad and _is_llm(n)
+                )
+                print(
+                    f"[per-group LR] LLM @ lr={llm_lr}, rest @ lr={self.args.learning_rate} "
+                    f"(trainable LLM params: {n_llm / 1e6:.1f}M)"
+                )
+            else:
+                optimizer_grouped_parameters = [
+                    {
+                        "params": [
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n in decay_parameters and p.requires_grad)
+                        ],
+                        "weight_decay": self.args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and p.requires_grad)
+                        ],
+                        "weight_decay": 0.0,
+                    },
+                ]
 
             optimizer_cls, optimizer_kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(
                 self.args

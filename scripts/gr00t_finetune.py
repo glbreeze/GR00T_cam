@@ -208,6 +208,14 @@ class ArgsConfig:
     learning_rate: float = 1e-4
     """Learning rate for training."""
 
+    llm_learning_rate: float | None = None
+    """Optional separate LR for the LLM backbone (``backbone.eagle_model.language_model.*``).
+    ``None`` (default) = single LR for all params (baseline-identical). Set this
+    when unfreezing the LLM (``--tune-llm``) to keep the proven action-head/geometry
+    LR on ``--learning-rate`` while giving the pretrained LLM a gentler LR (e.g.
+    ``--learning-rate 1e-4 --llm-learning-rate 2e-5``). Both groups share the same
+    scheduler/warmup; only the peak (base) LR differs per group."""
+
     weight_decay: float = 1e-5
     """Weight decay for AdamW optimizer."""
 
@@ -243,6 +251,11 @@ class ArgsConfig:
 
     gradient_accumulation_steps: int = 1
     """Gradient accumulation steps for training."""
+
+    gradient_checkpointing: bool = False
+    """Trade compute for memory by recomputing activations in the backward pass.
+    Off by default (baseline-identical). Enable when unfreezing the LLM/vision
+    (``--tune-llm`` / ``--tune-visual``) to fit larger batches on one GPU."""
 
     dataloader_prefetch_factor: int = 4
     """Prefetch factor for data loading."""
@@ -550,7 +563,7 @@ def main(config: ArgsConfig):
         run_name=None,
         remove_unused_columns=False,
         deepspeed="",
-        gradient_checkpointing=False,
+        gradient_checkpointing=config.gradient_checkpointing,
         bf16=True,
         tf32=True,
         per_device_train_batch_size=config.batch_size,
@@ -586,6 +599,10 @@ def main(config: ArgsConfig):
         ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
     )
+    # Stash the optional per-group LLM LR on the args object so DualBrainTrainer
+    # .create_optimizer can read it without changing the TrainRunner signature.
+    # TrainingArguments is a plain (non-slotted) dataclass, so this is safe.
+    training_args.llm_learning_rate = config.llm_learning_rate
 
     # 2.2 run experiment
     experiment = TrainRunner(
