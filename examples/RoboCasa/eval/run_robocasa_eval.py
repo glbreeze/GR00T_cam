@@ -109,7 +109,12 @@ class Args:
 
     # ---- CamVLA path ----
     use_camera_params: bool = False
-    img_size: int = 128  # render res; server resizes to 224 (matches training)
+    # Render res. Must equal the training video resolution recorded in the
+    # checkpoint's experiment_cfg/metadata.json (224 for these robocasa
+    # datasets): the server's VideoToTensor validates incoming frames against
+    # that metadata resolution *before* any resize, so a mismatch is rejected.
+    # When use_camera_params is set, intrinsics are computed at this resolution.
+    img_size: int = 224
 
     # ---- v0 eval action fixes (mirror openpi/robocasa24_plan.md) ----
     lock_control_mode: bool = True       # no-op: control_mode dim is dropped (11-dim env)

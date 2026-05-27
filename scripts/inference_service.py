@@ -85,6 +85,18 @@ class ArgsConfig:
     See gr00t/experiment/data_config.py for more details.
     """
 
+    use_camera_params: bool = False
+    """CamVLA: forward camera intrinsics/extrinsics into the transform so they
+    track pixel-grid augmentations (camera-aware resize/crop). Must match how the
+    checkpoint was trained. Configs that don't opt in ignore this."""
+
+    disable_geometric_augs: bool = False
+    """CamVLA: drop the random/center crop from the transform (deterministic
+    resize only). Required for checkpoints trained with --disable-geometric-augs
+    (e.g. the res224 point-distill models); otherwise the eval-time center crop
+    desyncs the image from the cached/rescaled intrinsics. Configs that don't opt
+    in ignore this."""
+
     port: int = 5555
     """The port number for the server."""
 
@@ -181,6 +193,13 @@ def main(args: ArgsConfig):
         # construct your own modality config and transform
         # see gr00t/utils/data.py for more details
         data_config = load_data_config(args.data_config)
+        # Forward camera/aug flags into data configs that opt in (CamVLA configs
+        # like libero / robocasa). Mirrors scripts/gr00t_finetune.py so the eval
+        # transform matches how the checkpoint was trained; other configs ignore
+        # these unknown attributes.
+        for attr in ("use_camera_params", "disable_geometric_augs"):
+            if hasattr(data_config, attr):
+                setattr(data_config, attr, getattr(args, attr))
         modality_config = data_config.modality_config()
         modality_transform = data_config.transform()
 

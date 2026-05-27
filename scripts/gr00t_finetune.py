@@ -595,14 +595,24 @@ def main(config: ArgsConfig):
         report_to=config.report_to,
         seed=42,
         do_eval=False,
+        # Keep find_unused_parameters=False. Unfreezing the backbone (--tune-llm /
+        # --tune-visual) creates BOTH unused trainable params (LLM lm_head / layers
+        # above select_layer) and params reused per-view (CamVLA geometry modules);
+        # find_unused_parameters handles the former but raises on the latter. The
+        # fix is DDP static_graph, enabled in DualBrainTrainer._wrap_model when
+        # tune_llm/tune_visual is set — it handles both with the faster path.
         ddp_find_unused_parameters=False,
         ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
     )
-    # Stash the optional per-group LLM LR on the args object so DualBrainTrainer
-    # .create_optimizer can read it without changing the TrainRunner signature.
-    # TrainingArguments is a plain (non-slotted) dataclass, so this is safe.
+    # Stash on the args object so DualBrainTrainer can read these without changing
+    # the TrainRunner signature (TrainingArguments is a plain, non-slotted
+    # dataclass, so attribute assignment is safe). llm_learning_rate -> per-group
+    # optimizer LR in create_optimizer; tune_llm/tune_visual -> DDP static_graph
+    # in _wrap_model.
     training_args.llm_learning_rate = config.llm_learning_rate
+    training_args.tune_llm = config.tune_llm
+    training_args.tune_visual = config.tune_visual
 
     # 2.2 run experiment
     experiment = TrainRunner(

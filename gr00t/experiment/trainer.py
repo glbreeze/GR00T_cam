@@ -90,6 +90,23 @@ class DualBrainTrainer(transformers.Trainer):
         self._extra_loss_sum: dict = defaultdict(float)
         self._extra_loss_n: int = 0
 
+    def _wrap_model(self, model, training=True, dataloader=None):
+        # Enable DDP static_graph when the backbone is unfrozen (--tune-llm /
+        # --tune-visual). Such runs both (a) leave some trainable params without
+        # gradients (the LLM lm_head / unembedding GR00T never reads, and any
+        # layers above select_layer) AND (b) reuse shared params more than once
+        # per forward (CamVLA geometry / cross-view modules run per camera view).
+        # find_unused_parameters handles (a) but RAISES on (b) ("Expected to mark
+        # a variable ready only once"); static_graph handles both, since the
+        # used/unused set is identical every iteration. The frozen baseline keeps
+        # the default path (no static graph) untouched.
+        model = super()._wrap_model(model, training=training, dataloader=dataloader)
+        if training and (getattr(self.args, "tune_llm", False) or getattr(self.args, "tune_visual", False)):
+            handler = getattr(self.accelerator, "ddp_handler", None)
+            if handler is not None:  # set by the parent for the DISTRIBUTED path; None on 1-GPU
+                handler.static_graph = True
+        return model
+
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
 
